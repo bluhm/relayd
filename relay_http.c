@@ -85,7 +85,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	if (!size) {
 		if (cre->dir == RELAY_DIR_RESPONSE)
 			return;
-		cre->toread = 0;
+		cre->toread = TOREAD_HTTP_HEADER;
 		goto done;
 	}
 
@@ -317,6 +317,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			return;
 		case HTTP_METHOD_CONNECT:
 			/* Data stream */
+			cre->toread = TOREAD_UNLIMITED;
 			bev->readcb = relay_read;
 			break;
 		case HTTP_METHOD_DELETE:
@@ -327,22 +328,25 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		case HTTP_METHOD_PUT:
 		case HTTP_METHOD_RESPONSE:
 			/* HTTP request payload */
-			if (cre->toread) {
+			if (cre->toread > 0)
 				bev->readcb = relay_read_httpcontent;
-				break;
-			}
 
 			/* Single-pass HTTP response */
-			bev->readcb = relay_read;
+			if (cre->toread < 0) {
+				cre->toread = TOREAD_UNLIMITED;
+				bev->readcb = relay_read;
+			}
+
 			break;
 		default:
 			/* HTTP handler */
+			cre->toread = TOREAD_HTTP_HEADER;
 			bev->readcb = relay_read_http;
 			break;
 		}
 		if (cre->chunked) {
 			/* Chunked transfer encoding */
-			cre->toread = 0;
+			cre->toread = TOREAD_HTTP_CHUNK_LENGHT;
 			bev->readcb = relay_read_httpchunks;
 		}
 
@@ -353,7 +357,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		relay_http_request_close(cre);
 
  done:
-		if (cre->dir == RELAY_DIR_REQUEST && !cre->toread &&
+		if (cre->dir == RELAY_DIR_REQUEST && cre->toread < 0 &&
 		    proto->lateconnect && cre->dst->bev == NULL) {
 			if (rlay->rl_conf.fwdmode == FWD_TRANS) {
 				relay_bindanyreq(con, 0, IPPROTO_TCP);
@@ -371,6 +375,8 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	if (EVBUFFER_LENGTH(src) && bev->readcb != relay_read_http)
 		bev->readcb(bev, arg);
 	bufferevent_enable(bev, EV_READ);
+	if (relay_splice(cre) == -1)
+		relay_close(con, strerror(errno));
 	return;
  fail:
 	relay_abort_http(con, 500, strerror(errno), 0);
@@ -390,17 +396,33 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 	if (gettimeofday(&con->se_tv_last, NULL) == -1)
 		goto fail;
 	size = EVBUFFER_LENGTH(src);
-	DPRINTF("%s: size %lu, to read %lld", __func__,
-	    size, cre->toread);
+	DPRINTF("%s: dir %d, size %lu, to read %lld",
+	    __func__, cre->dir, size, cre->toread);
 	if (!size)
 		return;
-	if (relay_bufferevent_write_buffer(cre->dst, src) == -1)
+	if (relay_spliceadjust(cre) == -1)
 		goto fail;
-	if ((off_t)size >= cre->toread)
+
+	if (cre->toread > 0) {
+		/* Read content data */
+		if ((off_t)size > cre->toread) {
+			size = cre->toread;
+			if (relay_bufferevent_write_chunk(cre->dst, src, size)
+			    == -1)
+				goto fail;
+			cre->toread = 0;
+		} else {
+			if (relay_bufferevent_write_buffer(cre->dst, src) == -1)
+				goto fail;
+			cre->toread -= size;
+		}
+		DPRINTF("%s: done, size %lu, to read %lld", __func__,
+		    size, cre->toread);
+	}
+	if (cre->toread == 0) {
+		cre->toread = TOREAD_HTTP_HEADER;
 		bev->readcb = relay_read_http;
-	cre->toread -= size;
-	DPRINTF("%s: done, size %lu, to read %lld", __func__,
-	    size, cre->toread);
+	}
 	if (con->se_done)
 		goto done;
 	if (bev->readcb != relay_read_httpcontent)
@@ -427,19 +449,37 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 	if (gettimeofday(&con->se_tv_last, NULL) == -1)
 		goto fail;
 	size = EVBUFFER_LENGTH(src);
-	DPRINTF("%s: size %lu, to read %lld", __func__,
-	    size, cre->toread);
+	DPRINTF("%s: dir %d, size %lu, to read %lld",
+	    __func__, cre->dir, size, cre->toread);
 	if (!size)
 		return;
+	if (relay_spliceadjust(cre) == -1)
+		goto fail;
 
-	if (!cre->toread) {
+	if (cre->toread > 0) {
+		/* Read chunk data */
+		if ((off_t)size > cre->toread) {
+			size = cre->toread;
+			if (relay_bufferevent_write_chunk(cre->dst, src, size)
+			    == -1)
+				goto fail;
+			cre->toread = 0;
+		} else {
+			if (relay_bufferevent_write_buffer(cre->dst, src) == -1)
+				goto fail;
+			cre->toread -= size;
+		}
+		DPRINTF("%s: done, size %lu, to read %lld", __func__,
+		    size, cre->toread);
+	}
+	if (cre->toread == TOREAD_HTTP_CHUNK_LENGHT) {
 		line = evbuffer_readline(src);
 		if (line == NULL) {
 			/* Ignore empty line, continue */
 			bufferevent_enable(bev, EV_READ);
 			return;
 		}
-		if (!strlen(line)) {
+		if (strlen(line) == 0) {
 			free(line);
 			goto next;
 		}
@@ -458,40 +498,38 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		}
 		free(line);
 
-		/* Last chunk is 0 bytes followed by an empty newline */
+		/* Last chunk is 0 bytes followed by optional trailer */
 		if ((cre->toread = lval) == 0) {
 			DPRINTF("%s: last chunk", __func__);
-
-			line = evbuffer_readline(src);
-			if (line == NULL) {
-				relay_close(con, "invalid last chunk");
-				return;
-			}
+			cre->toread = TOREAD_HTTP_CHUNK_TRAILER;
+		}
+	} else if (cre->toread == TOREAD_HTTP_CHUNK_TRAILER) {
+		/* Last chunk is 0 bytes followed by trailer and empty line */
+		line = evbuffer_readline(src);
+		if (line == NULL) {
+			/* Ignore empty line, continue */
+			bufferevent_enable(bev, EV_READ);
+			return;
+		}
+		if (relay_bufferevent_print(cre->dst, line) == -1 ||
+		    relay_bufferevent_print(cre->dst, "\r\n") == -1) {
 			free(line);
-			if (relay_bufferevent_print(cre->dst, "\r\n") == -1)
-				goto fail;
-
+			goto fail;
+		}
+		if (strlen(line) == 0) {
 			/* Switch to HTTP header mode */
+			cre->toread = TOREAD_HTTP_HEADER;
 			bev->readcb = relay_read_http;
 		}
-	} else {
-		/* Read chunk data */
-		if ((off_t)size > cre->toread)
-			size = cre->toread;
-		if (relay_bufferevent_write_chunk(cre->dst, src, size) == -1)
+		free(line);
+	} else if (cre->toread == 0) {
+		/* Chunk is terminated by an empty newline */
+		line = evbuffer_readline(src);
+		if (line != NULL)
+			free(line);
+		if (relay_bufferevent_print(cre->dst, "\r\n") == -1)
 			goto fail;
-		cre->toread -= size;
-		DPRINTF("%s: done, size %lu, to read %lld", __func__,
-		    size, cre->toread);
-
-		if (cre->toread == 0) {
-			/* Chunk is terminated by an empty (empty) newline */
-			line = evbuffer_readline(src);
-			if (line != NULL)
-				free(line);
-			if (relay_bufferevent_print(cre->dst, "\r\n") == -1)
-				goto fail;
-		}
+		cre->toread = TOREAD_HTTP_CHUNK_LENGHT;
 	}
 
  next:

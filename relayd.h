@@ -196,6 +196,11 @@ struct ctl_relay_event {
 	int			 buflen;
 };
 
+#define	TOREAD_UNLIMITED		-1
+#define	TOREAD_HTTP_HEADER		-2
+#define	TOREAD_HTTP_CHUNK_LENGHT	-3
+#define	TOREAD_HTTP_CHUNK_TRAILER	-4
+
 struct ctl_natlook {
 	objid_t			 id;
 	int			 proc;
@@ -988,6 +993,9 @@ int	 relay_cmp_af(struct sockaddr_storage *,
 	    struct sockaddr_storage *);
 void	 relay_write(struct bufferevent *, void *);
 void	 relay_read(struct bufferevent *, void *);
+int	 relay_splice(struct ctl_relay_event *);
+int	 relay_splicelen(struct ctl_relay_event *);
+int	 relay_spliceadjust(struct ctl_relay_event *);
 void	 relay_error(struct bufferevent *, short, void *);
 int	 relay_lognode(struct rsession *,
 	    struct protonode *, struct protonode *, char *, size_t);
