@@ -1258,11 +1258,11 @@ SSH session without delays between keystrokes or displayed output on
 the terminal:
 .Bd -literal -offset indent
 protocol "myssh" {
-        tcp { nodelay, socket buffer 65536 }
+	tcp { nodelay, socket buffer 65536 }
 }
 
 relay "sshforward" {
-        listen on www.example.com port 2222
+	listen on www.example.com port 2222
 	protocol "myssh"
 	forward to shell.example.com port 22
 }
