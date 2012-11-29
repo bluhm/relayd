@@ -70,6 +70,9 @@ void		 relay_input(struct rsession *);
 
 u_int32_t	 relay_hash_addr(struct sockaddr_storage *, u_int32_t);
 
+int		 relay_splice(struct ctl_relay_event *);
+int		 relay_splicelen(struct ctl_relay_event *);
+
 SSL_CTX		*relay_ssl_ctx_create(struct relay *);
 void		 relay_ssl_transaction(struct rsession *,
 		    struct ctl_relay_event *);
@@ -679,6 +682,9 @@ relay_connected(int fd, short sig, void *arg)
 	bufferevent_settimeout(bev,
 	    rlay->rl_conf.timeout.tv_sec, rlay->rl_conf.timeout.tv_sec);
 	bufferevent_enable(bev, EV_READ|EV_WRITE);
+
+	if (relay_splice(&con->se_out) == -1)
+		relay_close(con, strerror(errno));
 }
 
 void
@@ -727,6 +733,9 @@ relay_input(struct rsession *con)
 	bufferevent_settimeout(con->se_in.bev,
 	    rlay->rl_conf.timeout.tv_sec, rlay->rl_conf.timeout.tv_sec);
 	bufferevent_enable(con->se_in.bev, EV_READ|EV_WRITE);
+
+	if (relay_splice(&con->se_in) == -1)
+		relay_close(con, strerror(errno));
 }
 
 void
@@ -734,19 +743,10 @@ relay_write(struct bufferevent *bev, void *arg)
 {
 	struct ctl_relay_event	*cre = arg;
 	struct rsession		*con = cre->con;
-
 	if (gettimeofday(&con->se_tv_last, NULL) == -1)
-		goto fail;
+		con->se_done = 1;
 	if (con->se_done)
-		goto done;
-	if (relay_splice(cre->dst) == -1)
-		goto fail;
-	return;
- done:
-	relay_close(con, "last write (done)");
-	return;
- fail:
-	relay_close(con, strerror(errno));
+		relay_close(con, "last write (done)");
 }
 
 void
@@ -824,27 +824,11 @@ relay_splice(struct ctl_relay_event *cre)
 	    (proto->tcpflags & TCPFLAG_NSPLICE))
 		return (0);
 
-	if (cre->splicelen >= 0)
+	if (cre->bev->readcb != relay_read)
 		return (0);
-
-	if (! (cre->toread == TOREAD_UNLIMITED || cre->toread > 0)) {
-		DPRINTF("%s: session %d: splice dir %d, nothing to read %lld",
-		    __func__, con->se_id, cre->dir, cre->toread);
-		return (0);
-	}
-
-	/* do not splice before buffers have not been completely fushed */
-	if (EVBUFFER_LENGTH(cre->bev->input) ||
-	    EVBUFFER_LENGTH(cre->dst->bev->output)) {
-		DPRINTF("%s: session %d: splice dir %d, dirty buffer",
-		    __func__, con->se_id, cre->dir);
-		bufferevent_disable(cre->bev, EV_READ);
-		return (2);
-	}
 
 	bzero(&sp, sizeof(sp));
 	sp.sp_fd = cre->dst->s;
-	sp.sp_max = cre->toread > 0 ? cre->toread : 0;
 	sp.sp_idle = rlay->rl_conf.timeout;
 	if (setsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &sp, sizeof(sp)) == -1) {
 		log_debug("%s: session %d: splice dir %d failed: %s",
@@ -852,11 +836,8 @@ relay_splice(struct ctl_relay_event *cre)
 		return (-1);
 	}
 	cre->splicelen = 0;
-	bufferevent_enable(cre->bev, EV_READ);
-
-	DPRINTF("%s: session %d: splice dir %d, maximum %lld, successful",
-	    __func__, con->se_id, cre->dir, cre->toread);
-
+	DPRINTF("%s: session %d: splice dir %d successful",
+	    __func__, con->se_id, cre->dir);
 	return (1);
 }
 
@@ -867,38 +848,17 @@ relay_splicelen(struct ctl_relay_event *cre)
 	off_t			 len;
 	socklen_t		 optlen;
 
-	if (cre->splicelen < 0)
-		return (0);
-
 	optlen = sizeof(len);
 	if (getsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &len, &optlen) == -1) {
 		log_debug("%s: session %d: splice dir %d get length failed: %s",
 		    __func__, con->se_id, cre->dir, strerror(errno));
 		return (-1);
 	}
-
-	DPRINTF("%s: session %d: splice dir %d, length %lld",
-	    __func__, con->se_id, cre->dir, len);
-
 	if (len > cre->splicelen) {
 		cre->splicelen = len;
 		return (1);
 	}
 	return (0);
-}
-
-int
-relay_spliceadjust(struct ctl_relay_event *cre)
-{
-	if (cre->splicelen < 0)
-		return (0);
-	if (relay_splicelen(cre) == -1)
-		return (-1);
-	if (cre->splicelen > 0 && cre->toread > 0)
-		cre->toread -= cre->splicelen;
-	cre->splicelen = -1;
-
-	return (1);
 }
 
 void
@@ -940,16 +900,8 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				break;
 			}
 		}
-		if (relay_spliceadjust(cre) == -1)
-			goto fail;
 		if (relay_splice(cre) == -1)
 			goto fail;
-		return;
-	}
-	if (error & EVBUFFER_ERROR && errno == EMSGSIZE) {
-		if (relay_spliceadjust(cre) == -1)
-			goto fail;
-		bufferevent_enable(cre->bev, EV_READ);
 		return;
 	}
 	if (error & (EVBUFFER_READ|EVBUFFER_WRITE|EVBUFFER_EOF)) {

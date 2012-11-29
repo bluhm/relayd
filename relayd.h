@@ -993,9 +993,6 @@ int	 relay_cmp_af(struct sockaddr_storage *,
 	    struct sockaddr_storage *);
 void	 relay_write(struct bufferevent *, void *);
 void	 relay_read(struct bufferevent *, void *);
-int	 relay_splice(struct ctl_relay_event *);
-int	 relay_splicelen(struct ctl_relay_event *);
-int	 relay_spliceadjust(struct ctl_relay_event *);
 void	 relay_error(struct bufferevent *, short, void *);
 int	 relay_lognode(struct rsession *,
 	    struct protonode *, struct protonode *, char *, size_t);
