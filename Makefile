@@ -16,6 +16,4 @@ CFLAGS+=	-Wshadow -Wpointer-arith -Wcast-qual
 CFLAGS+=	-Wsign-compare -Wbounded
 CLEANFILES+=	y.tab.h
 
-DEBUG+=		-O0 -g -static -DDEBUG=2
-
 .include <bsd.prog.mk>
