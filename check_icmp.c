@@ -161,7 +161,7 @@ icmp_checks_timeout(struct ctl_icmp_event *cie, enum host_error he)
 void
 send_icmp(int s, short event, void *arg)
 {
-	struct ctl_icmp_event	*cie = (struct ctl_icmp_event *)arg;
+	struct ctl_icmp_event	*cie = arg;
 	struct table		*table;
 	struct host		*host;
 	struct sockaddr		*to;
@@ -262,7 +262,7 @@ send_icmp(int s, short event, void *arg)
 void
 recv_icmp(int s, short event, void *arg)
 {
-	struct ctl_icmp_event	*cie = (struct ctl_icmp_event *)arg;
+	struct ctl_icmp_event	*cie = arg;
 	u_char			 packet[ICMP_BUF_SIZE];
 	socklen_t		 slen;
 	struct sockaddr_storage	 ss;

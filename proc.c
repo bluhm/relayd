@@ -408,7 +408,7 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 void
 proc_dispatch(int fd, short event, void *arg)
 {
-	struct imsgev		*iev = (struct imsgev *)arg;
+	struct imsgev		*iev = arg;
 	struct privsep_proc	*p = iev->proc;
 	struct privsep		*ps = p->p_ps;
 	struct imsgbuf		*ibuf;

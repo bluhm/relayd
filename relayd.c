@@ -950,7 +950,7 @@ protonode_header(enum direction dir, struct protocol *proto,
 	pn = RB_FIND(proto_tree, tree, pk);
 	if (pn != NULL)
 		return (pn);
-	if ((pn = (struct protonode *)calloc(1, sizeof(*pn))) == NULL) {
+	if ((pn = calloc(1, sizeof(*pn))) == NULL) {
 		log_warn("%s: calloc", __func__);
 		return (NULL);
 	}
