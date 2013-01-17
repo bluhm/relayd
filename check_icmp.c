@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_icmp.c,v 1.33 2012/09/19 09:49:24 reyk Exp $	*/
+/*	$OpenBSD: check_icmp.c,v 1.34 2013/01/17 20:34:18 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>

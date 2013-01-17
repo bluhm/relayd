@@ -1,4 +1,4 @@
-/*	$OpenBSD: snmp.c,v 1.12 2012/02/01 19:24:46 camield Exp $	*/
+/*	$OpenBSD: snmp.c,v 1.13 2013/01/17 20:34:18 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2008 Reyk Floeter <reyk@openbsd.org>
