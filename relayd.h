@@ -196,10 +196,12 @@ struct ctl_relay_event {
 	int			 buflen;
 };
 
-#define	TOREAD_UNLIMITED		-1
-#define	TOREAD_HTTP_HEADER		-2
-#define	TOREAD_HTTP_CHUNK_LENGTH	-3
-#define	TOREAD_HTTP_CHUNK_TRAILER	-4
+enum httpchunk {
+	TOREAD_UNLIMITED		= -1,
+	TOREAD_HTTP_HEADER		= -2,
+	TOREAD_HTTP_CHUNK_LENGTH	= -3,
+	TOREAD_HTTP_CHUNK_TRAILER	= -4
+};
 
 struct ctl_natlook {
 	objid_t			 id;
