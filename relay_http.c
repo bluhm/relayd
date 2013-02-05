@@ -346,7 +346,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		}
 		if (cre->chunked) {
 			/* Chunked transfer encoding */
-			cre->toread = TOREAD_HTTP_CHUNK_LENGHT;
+			cre->toread = TOREAD_HTTP_CHUNK_LENGTH;
 			bev->readcb = relay_read_httpchunks;
 		}
 
@@ -466,7 +466,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		DPRINTF("%s: done, size %lu, to read %lld", __func__,
 		    size, cre->toread);
 	}
-	if (cre->toread == TOREAD_HTTP_CHUNK_LENGHT) {
+	if (cre->toread == TOREAD_HTTP_CHUNK_LENGTH) {
 		line = evbuffer_readline(src);
 		if (line == NULL) {
 			/* Ignore empty line, continue */
@@ -523,7 +523,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 			free(line);
 		if (relay_bufferevent_print(cre->dst, "\r\n") == -1)
 			goto fail;
-		cre->toread = TOREAD_HTTP_CHUNK_LENGHT;
+		cre->toread = TOREAD_HTTP_CHUNK_LENGTH;
 	}
 
  next:

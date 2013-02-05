@@ -198,7 +198,7 @@ struct ctl_relay_event {
 
 #define	TOREAD_UNLIMITED		-1
 #define	TOREAD_HTTP_HEADER		-2
-#define	TOREAD_HTTP_CHUNK_LENGHT	-3
+#define	TOREAD_HTTP_CHUNK_LENGTH	-3
 #define	TOREAD_HTTP_CHUNK_TRAILER	-4
 
 struct ctl_natlook {
