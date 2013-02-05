@@ -346,7 +346,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		}
 		if (cre->chunked) {
 			/* Chunked transfer encoding */
-			cre->toread = TOREAD_HTTP_CHUNK_LENGTH;
+			cre->toread = TOREAD_HTTP_CHUNK_LENGHT;
 			bev->readcb = relay_read_httpchunks;
 		}
 
@@ -375,6 +375,8 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	if (EVBUFFER_LENGTH(src) && bev->readcb != relay_read_http)
 		bev->readcb(bev, arg);
 	bufferevent_enable(bev, EV_READ);
+	if (relay_splice(cre) == -1)
+		relay_close(con, strerror(errno));
 	return;
  fail:
 	relay_abort_http(con, 500, strerror(errno), 0);
@@ -398,6 +400,8 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 	    __func__, cre->dir, size, cre->toread);
 	if (!size)
 		return;
+	if (relay_spliceadjust(cre) == -1)
+		goto fail;
 
 	if (cre->toread > 0) {
 		/* Read content data */
@@ -449,6 +453,8 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 	    __func__, cre->dir, size, cre->toread);
 	if (!size)
 		return;
+	if (relay_spliceadjust(cre) == -1)
+		goto fail;
 
 	if (cre->toread > 0) {
 		/* Read chunk data */
@@ -466,8 +472,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		DPRINTF("%s: done, size %lu, to read %lld", __func__,
 		    size, cre->toread);
 	}
-	switch (cre->toread) {
-	case TOREAD_HTTP_CHUNK_LENGTH:
+	if (cre->toread == TOREAD_HTTP_CHUNK_LENGHT) {
 		line = evbuffer_readline(src);
 		if (line == NULL) {
 			/* Ignore empty line, continue */
@@ -498,8 +503,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 			DPRINTF("%s: last chunk", __func__);
 			cre->toread = TOREAD_HTTP_CHUNK_TRAILER;
 		}
-		break;
-	case TOREAD_HTTP_CHUNK_TRAILER:
+	} else if (cre->toread == TOREAD_HTTP_CHUNK_TRAILER) {
 		/* Last chunk is 0 bytes followed by trailer and empty line */
 		line = evbuffer_readline(src);
 		if (line == NULL) {
@@ -518,16 +522,14 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 			bev->readcb = relay_read_http;
 		}
 		free(line);
-		break;
-	case 0:
+	} else if (cre->toread == 0) {
 		/* Chunk is terminated by an empty newline */
 		line = evbuffer_readline(src);
 		if (line != NULL)
 			free(line);
 		if (relay_bufferevent_print(cre->dst, "\r\n") == -1)
 			goto fail;
-		cre->toread = TOREAD_HTTP_CHUNK_LENGTH;
-		break;
+		cre->toread = TOREAD_HTTP_CHUNK_LENGHT;
 	}
 
  next:
