@@ -357,7 +357,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		relay_http_request_close(cre);
 
  done:
-		if (cre->dir == RELAY_DIR_REQUEST &&
+		if (cre->dir == RELAY_DIR_REQUEST && cre->toread <= 0 &&
 		    proto->lateconnect && cre->dst->bev == NULL) {
 			if (rlay->rl_conf.fwdmode == FWD_TRANS) {
 				relay_bindanyreq(con, 0, IPPROTO_TCP);
