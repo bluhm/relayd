@@ -849,7 +849,7 @@ relay_splice(struct ctl_relay_event *cre)
 		DPRINTF("%s: session %d: splice dir %d, dirty buffer",
 		    __func__, con->se_id, cre->dir);
 		bufferevent_disable(cre->bev, EV_READ);
-		return (2);
+		return (0);
 	}
 
 	bzero(&sp, sizeof(sp));
@@ -867,7 +867,7 @@ relay_splice(struct ctl_relay_event *cre)
 	DPRINTF("%s: session %d: splice dir %d, maximum %lld, successful",
 	    __func__, con->se_id, cre->dir, cre->toread);
 
-	return (1);
+	return (0);
 }
 
 int
@@ -896,6 +896,7 @@ relay_splicelen(struct ctl_relay_event *cre)
 		cre->splicelen = len;
 		return (1);
 	}
+
 	return (0);
 }
 
@@ -910,7 +911,7 @@ relay_spliceadjust(struct ctl_relay_event *cre)
 		cre->toread -= cre->splicelen;
 	cre->splicelen = -1;
 
-	return (1);
+	return (0);
 }
 
 void
