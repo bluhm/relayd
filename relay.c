@@ -843,7 +843,7 @@ relay_splice(struct ctl_relay_event *cre)
 		return (0);
 	}
 
-	/* do not splice before buffers have not been completely fushed */
+	/* do not splice before buffers have not been completely flushed */
 	if (EVBUFFER_LENGTH(cre->bev->input) ||
 	    EVBUFFER_LENGTH(cre->dst->bev->output)) {
 		DPRINTF("%s: session %d: splice dir %d, dirty buffer",
