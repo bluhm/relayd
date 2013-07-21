@@ -324,6 +324,8 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		case HTTP_METHOD_GET:
 		case HTTP_METHOD_HEAD:
 		case HTTP_METHOD_OPTIONS:
+			cre->toread = 0;
+			/* FALLTHROUGH */
 		case HTTP_METHOD_POST:
 		case HTTP_METHOD_PUT:
 		case HTTP_METHOD_RESPONSE:
@@ -331,9 +333,8 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			if (cre->toread > 0)
 				bev->readcb = relay_read_httpcontent;
 
-			/* Single-pass HTTP response */
-			if (cre->dir == RELAY_DIR_RESPONSE &&
-			    cre->toread < 0) {
+			/* Single-pass HTTP body */
+			if (cre->toread < 0) {
 				cre->toread = TOREAD_UNLIMITED;
 				bev->readcb = relay_read;
 			}
