@@ -661,6 +661,7 @@ struct protocol {
 	u_int8_t		 tcpflags;
 	int			 tcpbufsiz;
 	int			 tcpbacklog;
+	int			 tcprate;
 	u_int8_t		 tcpipttl;
 	u_int8_t		 tcpipminttl;
 	u_int8_t		 sslflags;

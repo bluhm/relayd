@@ -987,6 +987,12 @@ tcpflags	: SACK			{ proto->tcpflags |= TCPFLAG_SACK; }
 			}
 			free($2);
 		}
+		| RATE NUMBER	{
+			if ((proto->tcprate = $2) <= 0) {
+				yyerror("invalid rate limit: %d", $2);
+				YYERROR;
+			}
+		}
 		;
 
 sslflags_l	: sslflags comma sslflags_l
@@ -2135,6 +2141,7 @@ lookup(char *s)
 		{ "query",		QUERYSTR },
 		{ "quick",		QUICK },
 		{ "random",		RANDOM },
+		{ "rate",		RATE },
 		{ "real",		REAL },
 		{ "redirect",		REDIRECT },
 		{ "relay",		RELAY },
