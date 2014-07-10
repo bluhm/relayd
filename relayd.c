@@ -213,7 +213,7 @@ main(int argc, char *argv[])
 		errx(1, "unknown user %s", RELAYD_USER);
 
 	/* Configure the control socket */
-	ps->ps_csock.cs_name = RELAYD_SOCKET;
+	ps->ps_csock.cs_name = NULL;
 
 	log_init(debug);
 	log_verbose(verbose);
