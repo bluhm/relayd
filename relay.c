@@ -811,6 +811,7 @@ relay_read(struct bufferevent *bev, void *arg)
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	if (!EVBUFFER_LENGTH(src))
 		return;
@@ -942,6 +943,7 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				relay_close(con, "buffer event timeout");
 				break;
 			case 1:
+				cre->timedout = 1;
 				bufferevent_enable(bev, EV_READ);
 				break;
 			}
@@ -962,6 +964,9 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				bufferevent_enable(bev, EV_READ);
 				break;
 			}
+		} else if (cre->dst->timedout) {
+			relay_close(con, "splice timeout");
+			return;
 		}
 		if (relay_spliceadjust(cre) == -1)
 			goto fail;

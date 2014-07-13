@@ -173,6 +173,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	struct kv		*hdr = NULL;
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld",
@@ -457,6 +458,7 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 	size_t			 size;
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
@@ -510,6 +512,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 	size_t			 size;
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	size = EVBUFFER_LENGTH(src);
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,

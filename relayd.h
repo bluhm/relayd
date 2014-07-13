@@ -183,10 +183,11 @@ struct ctl_relay_event {
 	enum sslreneg_state	 sslreneg_state;
 
 	off_t			 splicelen;
-	int			 line;
-	size_t			 headerlen;
 	off_t			 toread;
+	size_t			 headerlen;
+	int			 line;
 	int			 done;
+	int			 timedout;
 	enum direction		 dir;
 
 	u_int8_t		*buf;
