@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_udp.c,v 1.32 2014/08/08 18:26:50 reyk Exp $	*/
+/*	$OpenBSD: relay_udp.c,v 1.35 2014/12/12 10:05:09 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
@@ -26,7 +26,6 @@
 #include <sys/hash.h>
 
 #include <net/if.h>
-#include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -75,8 +74,8 @@ relay_udp_privinit(struct relayd *x_env, struct relay *rlay)
 	if (env == NULL)
 		env = x_env;
 
-	if (rlay->rl_conf.flags & F_SSL)
-		fatalx("ssl over udp is not supported");
+	if (rlay->rl_conf.flags & F_TLS)
+		fatalx("tls over udp is not supported");
 	rlay->rl_conf.flags |= F_UDP;
 }
 
@@ -270,6 +269,7 @@ relay_udp_server(int fd, short sig, void *arg)
 
 	relay_sessions++;
 	SPLAY_INSERT(session_tree, &rlay->rl_sessions, con);
+	relay_session_publish(con);
 
 	/* Increment the per-relay session counter */
 	rlay->rl_stats[proc_id].last++;
