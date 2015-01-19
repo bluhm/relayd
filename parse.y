@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.196 2014/12/12 10:05:09 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.200 2015/01/16 15:06:40 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -30,13 +30,11 @@
 #include <sys/stat.h>
 #include <sys/queue.h>
 #include <sys/ioctl.h>
-#include <sys/hash.h>
 
 #include <net/if.h>
 #include <net/pfvar.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <arpa/nameser.h>
 #include <net/route.h>
 
 #include <ctype.h>
@@ -52,6 +50,7 @@
 #include <string.h>
 #include <ifaddrs.h>
 #include <syslog.h>
+#include <md5.h>
 
 #include <openssl/ssl.h>
 
@@ -118,6 +117,7 @@ static int		 dstmode;
 static enum key_type	 keytype = KEY_TYPE_NONE;
 static enum direction	 dir = RELAY_DIR_ANY;
 static char		*rulefile = NULL;
+static union hashkey	*hashkey = NULL;
 
 struct address	*host_v4(const char *);
 struct address	*host_v6(const char *);
@@ -143,10 +143,14 @@ typedef struct {
 		struct timeval		 tv;
 		struct table		*table;
 		struct portrange	 port;
+		struct {
+			union hashkey	 key;
+			int		 keyset;
+		}			 key;
 		enum direction		 dir;
 		struct {
 			struct sockaddr_storage	 ss;
-			char			 name[MAXHOSTNAMELEN];
+			char			 name[HOST_NAME_MAX+1];
 		}			 addr;
 		struct {
 			enum digest_type type;
@@ -185,6 +189,7 @@ typedef struct {
 %type	<v.digest>	digest optdigest
 %type	<v.table>	tablespec
 %type	<v.dir>		dir
+%type	<v.key>		hashkey
 
 %%
 
@@ -486,6 +491,14 @@ rdropts_l	: rdropts_l rdroptsl nl
 		;
 
 rdroptsl	: forwardmode TO tablespec interface	{
+			if (hashkey != NULL) {
+				memcpy(&rdr->conf.key,
+				    hashkey, sizeof(rdr->conf.key));
+				rdr->conf.flags |= F_HASHKEY;
+				free(hashkey);
+				hashkey = NULL;
+			}
+
 			switch ($1) {
 			case FWD_NORMAL:
 				if ($4 == NULL)
@@ -682,6 +695,7 @@ tablespec	: table			{
 			free($1);
 			table = tb;
 			dstmode = RELAY_DSTMODE_DEFAULT;
+			hashkey = NULL;
 		} tableopts_l		{
 			struct table	*tb;
 			if (table->conf.port == 0)
@@ -737,19 +751,42 @@ tableopts	: CHECK tablecheck
 			table->conf.skip_cnt =
 			    ($2 / conf->sc_interval.tv_sec) - 1;
 		}
-		| MODE dstmode		{
+		| MODE dstmode hashkey	{
 			switch ($2) {
 			case RELAY_DSTMODE_LOADBALANCE:
 			case RELAY_DSTMODE_HASH:
 			case RELAY_DSTMODE_SRCHASH:
-			case RELAY_DSTMODE_RANDOM:
+				if (hashkey != NULL) {
+					yyerror("key already specified");
+					free(hashkey);
+					YYERROR;
+				}
+				if ((hashkey = calloc(1,
+				    sizeof(*hashkey))) == NULL)
+					fatal("out of memory");
+				memcpy(hashkey, &$3.key, sizeof(*hashkey));
+				break;
+			default:
+				if ($3.keyset) {
+					yyerror("key not supported by mode");
+					YYERROR;
+				}
+				hashkey = NULL;
+				break;
+			}
+
+			switch ($2) {
+			case RELAY_DSTMODE_LOADBALANCE:
+			case RELAY_DSTMODE_HASH:
 				if (rdr != NULL) {
 					yyerror("mode not supported "
 					    "for redirections");
 					YYERROR;
 				}
 				/* FALLTHROUGH */
+			case RELAY_DSTMODE_RANDOM:
 			case RELAY_DSTMODE_ROUNDROBIN:
+			case RELAY_DSTMODE_SRCHASH:
 				dstmode = $2;
 				break;
 			case RELAY_DSTMODE_LEASTSTATES:
@@ -761,6 +798,50 @@ tableopts	: CHECK tablecheck
 				dstmode = $2;
 				break;
 			}
+		}
+		;
+
+/* should be in sync with sbin/pfctl/parse.y's hashkey */
+hashkey		: /* empty */		{
+			$$.keyset = 0;
+			$$.key.data[0] = arc4random();
+			$$.key.data[1] = arc4random();
+			$$.key.data[2] = arc4random();
+			$$.key.data[3] = arc4random();
+		}
+		| STRING		{
+			/* manual key configuration */
+			$$.keyset = 1;
+
+			if (!strncmp($1, "0x", 2)) {
+				if (strlen($1) != 34) {
+					free($1);
+					yyerror("hex key must be 128 bits "
+					    "(32 hex digits) long");
+					YYERROR;
+				}
+
+				if (sscanf($1, "0x%8x%8x%8x%8x",
+				    &$$.key.data[0], &$$.key.data[1],
+				    &$$.key.data[2], &$$.key.data[3]) != 4) {
+					free($1);
+					yyerror("invalid hex key");
+					YYERROR;
+				}
+			} else {
+				MD5_CTX	context;
+
+				MD5Init(&context);
+				MD5Update(&context, (unsigned char *)$1,
+				    strlen($1));
+				MD5Final((unsigned char *)$$.key.data,
+				    &context);
+				HTONL($$.key.data[0]);
+				HTONL($$.key.data[1]);
+				HTONL($$.key.data[2]);
+				HTONL($$.key.data[3]);
+			}
+			free($1);
 		}
 		;
 
@@ -1722,6 +1803,15 @@ forwardspec	: STRING port retry	{
 			if (!TAILQ_EMPTY(&rlay->rl_tables))
 				rlt->rlt_flags |= F_BACKUP;
 
+			if (hashkey != NULL &&
+			    (rlay->rl_conf.flags & F_HASHKEY) == 0) {
+				memcpy(&rlay->rl_conf.hashkey,
+				    hashkey, sizeof(rlay->rl_conf.hashkey));
+				rlay->rl_conf.flags |= F_HASHKEY;
+			}
+			free(hashkey);
+			hashkey = NULL;
+
 			TAILQ_INSERT_TAIL(&rlay->rl_tables, rlt, rlt_entry);
 		}
 		;
@@ -1834,6 +1924,9 @@ routeoptsl	: ROUTE address '/' NUMBER {
 			TAILQ_INSERT_TAIL(conf->sc_routes, nr, nr_route);
 		}
 		| FORWARD TO tablespec {
+			free(hashkey);
+			hashkey = NULL;
+
 			if (router->rt_gwtable) {
 				yyerror("router %s table already specified",
 				    router->rt_conf.name);

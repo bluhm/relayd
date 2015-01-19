@@ -1,7 +1,7 @@
-/*	$OpenBSD: relayd.h,v 1.198 2014/12/12 10:05:09 reyk Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.205 2015/01/16 15:08:52 reyk Exp $	*/
 
 /*
- * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
  * Copyright (c) 2006, 2007 Pierre-Yves Ritschard <pyr@openbsd.org>
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
  *
@@ -23,9 +23,10 @@
 
 #include <sys/tree.h>
 
-#include <sys/param.h>		/* MAXHOSTNAMELEN */
+#include <netinet/in.h>
 #include <limits.h>
 #include <imsg.h>
+#include <siphash.h>
 
 #ifndef nitems
 #define	nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
@@ -124,8 +125,8 @@ struct ctl_script {
 	objid_t		 host;
 	int		 retval;
 	struct timeval	 timeout;
-	char		 name[MAXHOSTNAMELEN];
-	char		 path[MAXPATHLEN];
+	char		 name[HOST_NAME_MAX+1];
+	char		 path[PATH_MAX];
 };
 
 struct ctl_demote {
@@ -332,6 +333,12 @@ struct address {
 };
 TAILQ_HEAD(addresslist, address);
 
+union hashkey {
+	/* Simplified version of pf_poolhashkey */
+	u_int32_t		 data[4];
+	SIPHASH_KEY		 siphashkey;
+};
+
 #define F_DISABLE		0x00000001
 #define F_BACKUP		0x00000002
 #define F_USED			0x00000004
@@ -359,13 +366,14 @@ TAILQ_HEAD(addresslist, address);
 #define F_DIVERT		0x01000000
 #define F_SCRIPT		0x02000000
 #define F_TLSINSPECT		0x04000000
+#define F_HASHKEY		0x08000000
 
 #define F_BITS								\
 	"\10\01DISABLE\02BACKUP\03USED\04DOWN\05ADD\06DEL\07CHANGED"	\
 	"\10STICKY-ADDRESS\11CHECK_DONE\12ACTIVE_RULESET\13CHECK_SENT"	\
 	"\14TLS\15NAT_LOOKUP\16DEMOTE\17LOOKUP_PATH\20DEMOTED\21UDP"	\
 	"\22RETURN\23TRAP\24NEEDPF\25PORT\26TLS_CLIENT\27NEEDRT"	\
-	"\30MATCH\31DIVERT\32SCRIPT"
+	"\30MATCH\31DIVERT\32SCRIPT\33TLS_INSPECT\34HASHKEY"
 
 enum forwardmode {
 	FWD_NORMAL		= 0,
@@ -378,7 +386,7 @@ struct host_config {
 	objid_t			 parentid;
 	objid_t			 tableid;
 	int			 retry;
-	char			 name[MAXHOSTNAMELEN];
+	char			 name[HOST_NAME_MAX+1];
 	struct sockaddr_storage	 ss;
 	int			 ttl;
 	int			 priority;
@@ -460,7 +468,7 @@ struct table_config {
 	int			 skip_cnt;
 	char			 name[TABLE_NAME_SIZE];
 	size_t			 name_len;
-	char			 path[MAXPATHLEN];
+	char			 path[PATH_MAX];
 	char			 exbuf[64];
 	char			 digest[41]; /* length of sha1 digest * 2 */
 	u_int8_t		 digest_type;
@@ -495,6 +503,7 @@ struct rdr_config {
 	objid_t			 table_id;
 	objid_t			 backup_id;
 	int			 mode;
+	union hashkey		 key;
 	char			 name[SRV_NAME_SIZE];
 	char			 tag[RD_TAG_NAME_SIZE];
 	struct timeval		 timeout;
@@ -517,8 +526,7 @@ struct rsession {
 	struct ctl_relay_event		 se_in;
 	struct ctl_relay_event		 se_out;
 	void				*se_priv;
-	u_int32_t			 se_hashkey;
-	int				 se_hashkeyset;
+	SIPHASH_CTX			 se_siphashctx;
 	struct relay_table		*se_table;
 	struct event			 se_ev;
 	struct timeval			 se_timeout;
@@ -674,9 +682,9 @@ struct protocol {
 	char			 tlsciphers[768];
 	int			 tlsdhparams;
 	int			 tlsecdhcurve;
-	char			 tlsca[MAXPATHLEN];
-	char			 tlscacert[MAXPATHLEN];
-	char			 tlscakey[MAXPATHLEN];
+	char			 tlsca[PATH_MAX];
+	char			 tlscacert[PATH_MAX];
+	char			 tlscakey[PATH_MAX];
 	char			*tlscapass;
 	char			 name[MAX_NAME_SIZE];
 	int			 cache;
@@ -701,7 +709,7 @@ struct relay_table {
 	struct table		*rlt_table;
 	u_int32_t		 rlt_flags;
 	int			 rlt_mode;
-	u_int32_t		 rlt_key;
+	u_int32_t		 rlt_index;
 	struct host		*rlt_host[RELAY_MAXHOSTS];
 	int			 rlt_nhosts;
 	TAILQ_ENTRY(relay_table) rlt_entry;
@@ -719,7 +727,7 @@ struct relay_config {
 	objid_t			 id;
 	u_int32_t		 flags;
 	objid_t			 proto;
-	char			 name[MAXHOSTNAMELEN];
+	char			 name[HOST_NAME_MAX+1];
 	in_port_t		 port;
 	in_port_t		 dstport;
 	int			 dstretry;
@@ -728,6 +736,7 @@ struct relay_config {
 	struct sockaddr_storage	 dstaf;
 	struct timeval		 timeout;
 	enum forwardmode	 fwdmode;
+	union hashkey		 hashkey;
 	off_t			 tls_cert_len;
 	off_t			 tls_key_len;
 	objid_t			 tls_keyid;
@@ -803,7 +812,7 @@ TAILQ_HEAD(netroutelist, netroute);
 struct router_config {
 	objid_t			 id;
 	u_int32_t		 flags;
-	char			 name[MAXHOSTNAMELEN];
+	char			 name[HOST_NAME_MAX+1];
 	char			 label[RT_LABEL_SIZE];
 	int			 nroutes;
 	objid_t			 gwtable;
@@ -1177,6 +1186,7 @@ const char
 const char
 	*relay_httperror_byid(u_int);
 int	 relay_httpdesc_init(struct ctl_relay_event *);
+ssize_t	 relay_http_time(time_t, char *, size_t);
 
 /* relay_udp.c */
 void	 relay_udp_privinit(struct relayd *, struct relay *);
@@ -1211,7 +1221,6 @@ int	 ssl_ctx_fake_private_key(SSL_CTX *, const void *, size_t,
 	    char *, off_t, X509 **, EVP_PKEY **);
 
 /* ssl_privsep.c */
-int	 ssl_ctx_use_certificate_chain(SSL_CTX *, char *, off_t);
 int	 ssl_ctx_load_verify_memory(SSL_CTX *, char *, off_t);
 
 /* ca.c */

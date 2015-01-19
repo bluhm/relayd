@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe_route.c,v 1.6 2014/06/25 11:05:15 reyk Exp $	*/
+/*	$OpenBSD: pfe_route.c,v 1.8 2015/01/16 15:06:40 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2009 - 2011 Reyk Floeter <reyk@openbsd.org>
@@ -22,7 +22,6 @@
 
 #include <net/if.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
 #include <net/route.h>
 
 #include <stdio.h>
@@ -76,7 +75,7 @@ sync_routes(struct relayd *env, struct router *rt)
 {
 	struct netroute		*nr;
 	struct host		*host;
-	char			 buf[MAXHOSTNAMELEN];
+	char			 buf[HOST_NAME_MAX+1];
 	struct ctl_netroute	 crt;
 
 	if (!(env->sc_flags & F_NEEDRT))

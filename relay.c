@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.182 2014/12/12 10:05:09 reyk Exp $	*/
+/*	$OpenBSD: relay.c,v 1.187 2015/01/16 15:08:52 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -23,13 +23,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/tree.h>
-#include <sys/hash.h>
 
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
-#include <arpa/inet.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -46,6 +44,8 @@
 #include <openssl/ssl.h>
 
 #include "relayd.h"
+
+#define MINIMUM(a, b)	(((a) < (b)) ? (a) : (b))
 
 void		 relay_statistics(int, short, void *);
 int		 relay_dispatch_parent(int, struct privsep_proc *,
@@ -72,7 +72,7 @@ int		 relay_socket_connect(struct sockaddr_storage *, in_port_t,
 void		 relay_accept(int, short, void *);
 void		 relay_input(struct rsession *);
 
-u_int32_t	 relay_hash_addr(struct sockaddr_storage *, u_int32_t);
+void		 relay_hash_addr(SIPHASH_CTX *, struct sockaddr_storage *, int);
 
 DH *		 relay_tls_get_dhparams(int);
 void		 relay_tls_callback_info(const SSL *, int, int);
@@ -438,21 +438,7 @@ relay_launch(void)
 			 */
 			rule_settable(&rlay->rl_proto->rules, rlt);
 
-			switch (rlt->rlt_mode) {
-			case RELAY_DSTMODE_ROUNDROBIN:
-			case RELAY_DSTMODE_RANDOM:
-				rlt->rlt_key = 0;
-				break;
-			case RELAY_DSTMODE_LOADBALANCE:
-			case RELAY_DSTMODE_HASH:
-			case RELAY_DSTMODE_SRCHASH:
-				rlt->rlt_key =
-				    hash32_str(rlay->rl_conf.name, HASHINIT);
-				rlt->rlt_key =
-				    hash32_str(rlt->rlt_table->conf.name,
-				    rlt->rlt_key);
-				break;
-			}
+			rlt->rlt_index = 0;
 			rlt->rlt_nhosts = 0;
 			TAILQ_FOREACH(host, &rlt->rlt_table->hosts, entry) {
 				if (rlt->rlt_nhosts >= RELAY_MAXHOSTS)
@@ -1091,6 +1077,11 @@ relay_accept(int fd, short event, void *arg)
 	getmonotime(&con->se_tv_start);
 	bcopy(&con->se_tv_start, &con->se_tv_last, sizeof(con->se_tv_last));
 
+	if (rlay->rl_conf.flags & F_HASHKEY) {
+		SipHash24_Init(&con->se_siphashctx,
+		    &rlay->rl_conf.hashkey.siphashkey);
+	}
+
 	relay_sessions++;
 	SPLAY_INSERT(session_tree, &rlay->rl_sessions, con);
 	relay_session_publish(con);
@@ -1180,23 +1171,27 @@ relay_accept(int fd, short event, void *arg)
 	}
 }
 
-u_int32_t
-relay_hash_addr(struct sockaddr_storage *ss, u_int32_t p)
+void
+relay_hash_addr(SIPHASH_CTX *ctx, struct sockaddr_storage *ss, int portset)
 {
 	struct sockaddr_in	*sin4;
 	struct sockaddr_in6	*sin6;
+	in_port_t		 port;
 
 	if (ss->ss_family == AF_INET) {
 		sin4 = (struct sockaddr_in *)ss;
-		p = hash32_buf(&sin4->sin_addr,
-		    sizeof(struct in_addr), p);
+		SipHash24_Update(ctx, &sin4->sin_addr,
+		    sizeof(struct in_addr));
 	} else {
 		sin6 = (struct sockaddr_in6 *)ss;
-		p = hash32_buf(&sin6->sin6_addr,
-		    sizeof(struct in6_addr), p);
+		SipHash24_Update(ctx, &sin6->sin6_addr,
+		    sizeof(struct in6_addr));
 	}
 
-	return (p);
+	if (portset != -1) {
+		port = (in_port_t)portset;
+		SipHash24_Update(ctx, &port, sizeof(port));
+	}
 }
 
 int
@@ -1206,8 +1201,8 @@ relay_from_table(struct rsession *con)
 	struct host		*host;
 	struct relay_table	*rlt = NULL;
 	struct table		*table = NULL;
-	u_int32_t		 p = con->se_hashkey;
 	int			 idx = -1;
+	u_int64_t		 p = 0;
 
 	/* the table is already selected */
 	if (con->se_table != NULL) {
@@ -1234,39 +1229,43 @@ relay_from_table(struct rsession *con)
 		    __func__, con->se_id);
 		return (-1);
 	}
-	if (!con->se_hashkeyset) {
-		p = con->se_hashkey = rlt->rlt_key;
-		con->se_hashkeyset = 1;
-	}
 
 	switch (rlt->rlt_mode) {
 	case RELAY_DSTMODE_ROUNDROBIN:
-		if ((int)rlt->rlt_key >= rlt->rlt_nhosts)
-			rlt->rlt_key = 0;
-		idx = (int)rlt->rlt_key;
+		if ((int)rlt->rlt_index >= rlt->rlt_nhosts)
+			rlt->rlt_index = 0;
+		idx = (int)rlt->rlt_index;
 		break;
 	case RELAY_DSTMODE_RANDOM:
 		idx = (int)arc4random_uniform(rlt->rlt_nhosts);
 		break;
 	case RELAY_DSTMODE_SRCHASH:
+		/* Source IP address without port */
+		relay_hash_addr(&con->se_siphashctx, &con->se_in.ss, -1);
+		break;
 	case RELAY_DSTMODE_LOADBALANCE:
 		/* Source IP address without port */
-		p = relay_hash_addr(&con->se_in.ss, p);
-		if (rlt->rlt_mode == RELAY_DSTMODE_SRCHASH)
-			break;
+		relay_hash_addr(&con->se_siphashctx, &con->se_in.ss, -1);
 		/* FALLTHROUGH */
 	case RELAY_DSTMODE_HASH:
 		/* Local "destination" IP address and port */
-		p = relay_hash_addr(&rlay->rl_conf.ss, p);
-		p = hash32_buf(&rlay->rl_conf.port,
-		    sizeof(rlay->rl_conf.port), p);
+		relay_hash_addr(&con->se_siphashctx, &rlay->rl_conf.ss,
+		    rlay->rl_conf.port);
 		break;
 	default:
 		fatalx("relay_from_table: unsupported mode");
 		/* NOTREACHED */
 	}
-	if (idx == -1 && (idx = p % rlt->rlt_nhosts) >= RELAY_MAXHOSTS)
-		return (-1);
+	if (idx == -1) {
+		p = SipHash24_End(&con->se_siphashctx);
+
+		/* Reset hash context */
+		SipHash24_Init(&con->se_siphashctx,
+		    &rlay->rl_conf.hashkey.siphashkey);
+
+		if ((idx = p % rlt->rlt_nhosts) >= RELAY_MAXHOSTS)
+			return (-1);
+	}
 	host = rlt->rlt_host[idx];
 	DPRINTF("%s: session %d: table %s host %s, p 0x%08x, idx %d",
 	    __func__, con->se_id, table->conf.name, host->conf.name, p, idx);
@@ -1289,7 +1288,7 @@ relay_from_table(struct rsession *con)
 
  found:
 	if (rlt->rlt_mode == RELAY_DSTMODE_ROUNDROBIN)
-		rlt->rlt_key = host->idx + 1;
+		rlt->rlt_index = host->idx + 1;
 	con->se_retry = host->conf.retry;
 	con->se_out.port = table->conf.port;
 	bcopy(&host->conf.ss, &con->se_out.ss, sizeof(con->se_out.ss));
@@ -1967,7 +1966,7 @@ relay_tls_callback_dh(SSL *ssl, int export, int keylen)
 	}
 
 	/* get built-in params based on the shorter key length */
-	dh = relay_tls_get_dhparams(MIN(keylen, maxlen));
+	dh = relay_tls_get_dhparams(MINIMUM(keylen, maxlen));
 
 	return (dh);
 }
@@ -1989,6 +1988,7 @@ relay_tls_ctx_create(struct relay *rlay)
 	struct protocol	*proto = rlay->rl_proto;
 	SSL_CTX		*ctx;
 	EC_KEY		*ecdhkey;
+	u_int8_t	 sid[SSL_MAX_SID_CTX_LENGTH];
 
 	ctx = SSL_CTX_new(SSLv23_method());
 	if (ctx == NULL)
@@ -1996,7 +1996,7 @@ relay_tls_ctx_create(struct relay *rlay)
 
 	/* Modify session timeout and cache size*/
 	SSL_CTX_set_timeout(ctx,
-	    (long)MIN(rlay->rl_conf.timeout.tv_sec, LONG_MAX));
+	    (long)MINIMUM(rlay->rl_conf.timeout.tv_sec, LONG_MAX));
 	if (proto->cache < -1) {
 		SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 	} else if (proto->cache >= -1) {
@@ -2061,7 +2061,7 @@ relay_tls_ctx_create(struct relay *rlay)
 		return (ctx);
 
 	log_debug("%s: loading certificate", __func__);
-	if (!ssl_ctx_use_certificate_chain(ctx,
+	if (!SSL_CTX_use_certificate_chain(ctx,
 	    rlay->rl_tls_cert, rlay->rl_conf.tls_cert_len))
 		goto err;
 
@@ -2084,9 +2084,13 @@ relay_tls_ctx_create(struct relay *rlay)
 			goto err;
 	}
 
-	/* Set session context to the local relay name */
-	if (!SSL_CTX_set_session_id_context(ctx, rlay->rl_conf.name,
-	    strlen(rlay->rl_conf.name)))
+	/*
+	 * Set session ID context to a random value.  We don't support
+	 * persistent caching of sessions so it is OK to set a temporary
+	 * session ID context that is valid during run time.
+	 */
+	arc4random_buf(sid, sizeof(sid));
+	if (!SSL_CTX_set_session_id_context(ctx, sid, sizeof(sid)))
 		goto err;
 
 	/* The text versions of the keys/certs are not needed anymore */
@@ -2336,7 +2340,7 @@ relay_tls_readcb(int fd, short event, void *arg)
 	}
 
 	if (bufev->wm_read.high != 0)
-		howmuch = MIN(sizeof(rbuf), bufev->wm_read.high);
+		howmuch = MINIMUM(sizeof(rbuf), bufev->wm_read.high);
 
 	ret = SSL_read(cre->ssl, rbuf, howmuch);
 	if (ret <= 0) {
