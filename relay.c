@@ -2051,7 +2051,7 @@ relay_tls_ctx_create(struct relay *rlay)
 	/* Verify the server certificate if we have a CA chain */
 	if ((rlay->rl_conf.flags & F_TLSCLIENT) &&
 	    (rlay->rl_tls_ca != NULL)) {
-		if (!ssl_ctx_load_verify_memory(ctx,
+		if (!SSL_CTX_load_verify_mem(ctx,
 		    rlay->rl_tls_ca, rlay->rl_conf.tls_ca_len))
 			goto err;
 		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
