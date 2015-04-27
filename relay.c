@@ -988,7 +988,7 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 			dst = EVBUFFER_OUTPUT(cre->dst->bev);
 			if (EVBUFFER_LENGTH(dst))
 				return;
-		} else if (cre->output != NULL && EVBUFFER_LENGTH(cre->output))
+		} else if (cre->toread == TOREAD_UNLIMITED || cre->toread == 0)
 			return;
 
 		relay_close(con, "done");
