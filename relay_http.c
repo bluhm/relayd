@@ -35,6 +35,9 @@
 #include <fnmatch.h>
 #include <siphash.h>
 #include <imsg.h>
+#if DEBUG > 1
+#include <unistd.h>
+#endif
 
 #include "relayd.h"
 #include "http.h"

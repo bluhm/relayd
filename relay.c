@@ -988,7 +988,7 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 			dst = EVBUFFER_OUTPUT(cre->dst->bev);
 			if (EVBUFFER_LENGTH(dst))
 				return;
-		} else
+		} else if (cre->output != NULL && EVBUFFER_LENGTH(cre->output))
 			return;
 
 		relay_close(con, "done");
@@ -1263,7 +1263,7 @@ relay_from_table(struct rsession *con)
 			return (-1);
 	}
 	host = rlt->rlt_host[idx];
-	DPRINTF("%s: session %d: table %s host %s, p 0x%08x, idx %d",
+	DPRINTF("%s: session %d: table %s host %s, p 0x%016llx, idx %d",
 	    __func__, con->se_id, table->conf.name, host->conf.name, p, idx);
 	while (host != NULL) {
 		DPRINTF("%s: session %d: host %s", __func__,
