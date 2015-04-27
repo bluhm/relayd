@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.200 2015/01/16 15:06:40 deraadt Exp $	*/
+/*	$OpenBSD: parse.y,v 1.203 2015/02/08 04:50:32 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -30,29 +30,29 @@
 #include <sys/stat.h>
 #include <sys/queue.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
+#include <sys/tree.h>
 
-#include <net/if.h>
-#include <net/pfvar.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <net/pfvar.h>
 #include <net/route.h>
 
-#include <ctype.h>
-#include <unistd.h>
-#include <err.h>
-#include <errno.h>
-#include <event.h>
-#include <limits.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <err.h>
+#include <endian.h>
+#include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <string.h>
 #include <ifaddrs.h>
 #include <syslog.h>
 #include <md5.h>
-
-#include <openssl/ssl.h>
 
 #include "relayd.h"
 #include "http.h"
@@ -2889,6 +2889,7 @@ host_dns(const char *s, struct addresslist *al, int max,
 	bzero(&hints, sizeof(hints));
 	hints.ai_family = PF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM; /* DUMMY */
+	hints.ai_flags = AI_ADDRCONFIG;
 	error = getaddrinfo(s, NULL, &hints, &res0);
 	if (error == EAI_AGAIN || error == EAI_NODATA || error == EAI_NONAME)
 		return (0);

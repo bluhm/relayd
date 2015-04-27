@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.187 2015/01/16 15:08:52 reyk Exp $	*/
+/*	$OpenBSD: relay.c,v 1.192 2015/04/23 17:03:01 florian Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -21,24 +21,22 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/tree.h>
 
-#include <net/if.h>
 #include <netinet/in.h>
-#include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdio.h>
-#include <err.h>
-#include <pwd.h>
 #include <event.h>
-#include <fnmatch.h>
+#include <siphash.h>
+#include <imsg.h>
 
 #include <openssl/dh.h>
 #include <openssl/ssl.h>
@@ -1043,6 +1041,12 @@ relay_accept(int fd, short event, void *arg)
 	if ((con = calloc(1, sizeof(*con))) == NULL)
 		goto err;
 
+	/* Pre-allocate log buffer */
+	con->se_haslog = 0;
+	con->se_log = evbuffer_new();
+	if (con->se_log == NULL)
+		goto err;
+
 	con->se_in.s = s;
 	con->se_in.ssl = NULL;
 	con->se_out.s = -1;
@@ -1093,14 +1097,6 @@ relay_accept(int fd, short event, void *arg)
 	con->se_out.output = evbuffer_new();
 	if (con->se_out.output == NULL) {
 		relay_close(con, "failed to allocate output buffer");
-		return;
-	}
-
-	/* Pre-allocate log buffer */
-	con->se_haslog = 0;
-	con->se_log = evbuffer_new();
-	if (con->se_log == NULL) {
-		relay_close(con, "failed to allocate log buffer");
 		return;
 	}
 
@@ -2051,7 +2047,7 @@ relay_tls_ctx_create(struct relay *rlay)
 	/* Verify the server certificate if we have a CA chain */
 	if ((rlay->rl_conf.flags & F_TLSCLIENT) &&
 	    (rlay->rl_tls_ca != NULL)) {
-		if (!ssl_ctx_load_verify_memory(ctx,
+		if (!SSL_CTX_load_verify_mem(ctx,
 		    rlay->rl_tls_ca, rlay->rl_conf.tls_ca_len))
 			goto err;
 		SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
@@ -2061,7 +2057,7 @@ relay_tls_ctx_create(struct relay *rlay)
 		return (ctx);
 
 	log_debug("%s: loading certificate", __func__);
-	if (!SSL_CTX_use_certificate_chain(ctx,
+	if (!SSL_CTX_use_certificate_chain_mem(ctx,
 	    rlay->rl_tls_cert, rlay->rl_conf.tls_cert_len))
 		goto err;
 
@@ -2411,7 +2407,7 @@ relay_tls_writecb(int fd, short event, void *arg)
 		goto err;
 	}
 
-        if (cre->tlsreneg_state == TLSRENEG_ABORT) {
+	if (cre->tlsreneg_state == TLSRENEG_ABORT) {
 		what |= EVBUFFER_ERROR;
 		goto err;
 	}

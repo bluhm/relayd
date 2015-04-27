@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe.c,v 1.77 2015/01/16 15:06:40 deraadt Exp $	*/
+/*	$OpenBSD: pfe.c,v 1.80 2015/04/21 01:46:57 jsg Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -16,21 +16,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/stat.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include <sys/types.h>
+#include <sys/queue.h>
+#include <sys/time.h>
+#include <sys/uio.h>
 
-#include <net/if.h>
-
-#include <errno.h>
 #include <event.h>
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <pwd.h>
-
-#include <openssl/ssl.h>
+#include <imsg.h>
 
 #include "relayd.h"
 
@@ -295,8 +289,11 @@ pfe_dispatch_relay(int fd, struct privsep_proc *p, struct imsg *imsg)
 			return (0);		/* XXX */
 		memcpy(s, imsg->data, sizeof(*s));
 		TAILQ_FOREACH(t, &env->sc_sessions, se_entry) {
-			if (t->se_id == s->se_id)	/* duplicate registration */
+			/* duplicate registration */
+			if (t->se_id == s->se_id) {
+				free(s);
 				return (0);
+			}
 			if (t->se_id > s->se_id)
 				break;
 		}
@@ -314,8 +311,9 @@ pfe_dispatch_relay(int fd, struct privsep_proc *p, struct imsg *imsg)
 		if (s) {
 			TAILQ_REMOVE(&env->sc_sessions, s, se_entry);
 			free(s);
-		} else
-			log_warnx("removal of unpublished session %i", sid);
+		} else {
+			DPRINTF("removal of unpublished session %i", sid);
+		}
 		break;
 	default:
 		return (-1);

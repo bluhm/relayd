@@ -1,4 +1,4 @@
-/*	$OpenBSD: ssl.c,v 1.27 2015/01/16 15:06:41 deraadt Exp $	*/
+/*	$OpenBSD: ssl.c,v 1.29 2015/03/24 08:44:04 giovanni Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -17,24 +17,20 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <sys/queue.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 
-#include <net/if.h>
-#include <netinet/in.h>
-
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <event.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
-#include <stdlib.h>
-#include <errno.h>
+#include <imsg.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/engine.h>
-#include <openssl/rsa.h>
 
 #include "relayd.h"
 
@@ -458,6 +454,7 @@ ssl_load_pkey(const void *data, size_t datalen, char *buf, off_t len,
 		EVP_PKEY_free(pkey);
 	if (x509 != NULL)
 		X509_free(x509);
+	free(exdata);
 
 	return (0);
 }

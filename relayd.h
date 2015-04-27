@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.205 2015/01/16 15:08:52 reyk Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.208 2015/03/09 17:20:38 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -21,12 +21,21 @@
 #ifndef _RELAYD_H
 #define _RELAYD_H
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/queue.h>
 #include <sys/tree.h>
+#include <sys/time.h>
 
-#include <netinet/in.h>
+#include <net/if.h>
+
+#include <stdarg.h>
 #include <limits.h>
-#include <imsg.h>
 #include <siphash.h>
+#include <event.h>
+#include <imsg.h>
+
+#include <openssl/ssl.h>
 
 #ifndef nitems
 #define	nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
@@ -519,7 +528,6 @@ struct rdr {
 };
 TAILQ_HEAD(rdrlist, rdr);
 
-struct relay;
 struct rsession {
 	objid_t				 se_id;
 	objid_t				 se_relayid;
@@ -657,7 +665,7 @@ TAILQ_HEAD(relay_rules, relay_rule);
 #define TLSFLAG_CIPHER_SERVER_PREF		0x20
 #define TLSFLAG_CLIENT_RENEG			0x40
 #define TLSFLAG_DEFAULT				\
-	(TLSFLAG_TLSV1|TLSFLAG_CLIENT_RENEG)
+	(TLSFLAG_TLSV1_2|TLSFLAG_CLIENT_RENEG)
 
 #define TLSFLAG_BITS						\
 	"\06\01sslv3\02tlsv1.0\03tlsv1.1\04tlsv1.2"	\
@@ -791,7 +799,6 @@ enum dstmode {
 };
 #define RELAY_DSTMODE_DEFAULT		RELAY_DSTMODE_ROUNDROBIN
 
-struct router;
 struct netroute_config {
 	objid_t			 id;
 	struct sockaddr_storage	 ss;
@@ -860,7 +867,6 @@ enum blockmodes {
 	BM_NORMAL,
 	BM_NONBLOCK
 };
-
 
 struct imsgev {
 	struct imsgbuf		 ibuf;
@@ -1219,9 +1225,6 @@ int	 ssl_load_pkey(const void *, size_t, char *, off_t,
 	    X509 **, EVP_PKEY **);
 int	 ssl_ctx_fake_private_key(SSL_CTX *, const void *, size_t,
 	    char *, off_t, X509 **, EVP_PKEY **);
-
-/* ssl_privsep.c */
-int	 ssl_ctx_load_verify_memory(SSL_CTX *, char *, off_t);
 
 /* ca.c */
 pid_t	 ca(struct privsep *, struct privsep_proc *);
