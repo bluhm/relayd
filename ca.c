@@ -417,11 +417,14 @@ rsae_keygen(RSA *rsa, int bits, BIGNUM *e, BN_GENCB *cb)
 void
 ca_engine_init(struct relayd *x_env)
 {
-	ENGINE		*e;
+	ENGINE		*e = NULL;
 	const char	*errstr, *name;
 
 	if (env == NULL)
 		env = x_env;
+
+	if (rsa_default != NULL)
+		return;
 
 	if ((e = ENGINE_get_default_RSA()) == NULL) {
 		if ((e = ENGINE_new()) == NULL) {

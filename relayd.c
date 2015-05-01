@@ -546,12 +546,13 @@ parent_dispatch_ca(int fd, struct privsep_proc *p, struct imsg *imsg)
 }
 
 void
-purge_table(struct tablelist *head, struct table *table)
+purge_table(struct relayd *env, struct tablelist *head, struct table *table)
 {
 	struct host		*host;
 
 	while ((host = TAILQ_FIRST(&table->hosts)) != NULL) {
 		TAILQ_REMOVE(&table->hosts, host, entry);
+		TAILQ_REMOVE(&env->sc_hosts, host, globalentry);
 		if (event_initialized(&host->cte.ev)) {
 			event_del(&host->cte.ev);
 			close(host->cte.s);
