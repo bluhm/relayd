@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.24 2015/01/22 17:42:09 reyk Exp $	*/
+/*	$OpenBSD: config.c,v 1.25 2015/05/02 13:15:24 claudio Exp $	*/
 
 /*
  * Copyright (c) 2011 - 2014 Reyk Floeter <reyk@openbsd.org>
