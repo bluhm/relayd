@@ -1184,7 +1184,7 @@ void	 relay_http(struct relayd *);
 void	 relay_http_init(struct relay *);
 void	 relay_abort_http(struct rsession *, u_int, const char *,
 	    u_int16_t);
-void	 relay_read_http(struct bufferevent *, void *);
+void	 relay_read_http_cb(struct bufferevent *, void *);
 void	 relay_close_http(struct rsession *);
 u_int	 relay_httpmethod_byname(const char *);
 const char

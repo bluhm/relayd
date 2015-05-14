@@ -683,7 +683,7 @@ relay_connected(int fd, short sig, void *arg)
 			return;
 		}
 		con->se_out.toread = TOREAD_HTTP_HEADER;
-		outrd = relay_read_http;
+		outrd = relay_read_http_cb;
 		break;
 	case RELAY_PROTO_TCP:
 		/* Use defaults */
@@ -734,7 +734,7 @@ relay_input(struct rsession *con)
 			return;
 		}
 		con->se_in.toread = TOREAD_HTTP_HEADER;
-		inrd = relay_read_http;
+		inrd = relay_read_http_cb;
 		break;
 	case RELAY_PROTO_TCP:
 		/* Use defaults */

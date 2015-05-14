@@ -180,6 +180,14 @@ struct http_mediatype {
 	{ NULL }					\
 }
 
+/* Define state of current http relay */
+enum httpstate {
+	HTTP_STATE_READ_HEADER = 0,
+	HTTP_STATE_READ_CONTENT,
+	HTTP_STATE_READ_CHUNKS,
+	HTTP_STATE_READ_DATA,
+};
+
 /* Used during runtime */
 struct http_descriptor {
 	struct kv		 http_pathquery;
@@ -202,6 +210,8 @@ struct http_descriptor {
 	/* A tree of headers and attached lists for repeated headers. */
 	struct kv		*http_lastheader;
 	struct kvtree		 http_headers;
+
+	enum httpstate		 http_state;
 };
 
 #endif /* _HTTP_H */

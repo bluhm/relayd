@@ -49,8 +49,9 @@ int		 relay_lookup_url(struct ctl_relay_event *,
 int		 relay_lookup_query(struct ctl_relay_event *, struct kv *);
 int		 relay_lookup_cookie(struct ctl_relay_event *, const char *,
 		    struct kv *);
-void		 relay_read_httpcontent(struct bufferevent *, void *);
-void		 relay_read_httpchunks(struct bufferevent *, void *);
+int		 relay_read_http(struct bufferevent *, void *);
+int		 relay_read_httpcontent(struct bufferevent *, void *);
+int		 relay_read_httpchunks(struct bufferevent *, void *);
 char		*relay_expand_http(struct ctl_relay_event *, char *,
 		    char *, size_t);
 int		 relay_writeheader_kv(struct ctl_relay_event *, struct kv *);
@@ -151,7 +152,53 @@ relay_httpdesc_free(struct http_descriptor *desc)
 	kv_purge(&desc->http_headers);
 }
 
-void
+void relay_read_http_cb(struct bufferevent *bev, void *arg) {
+	struct ctl_relay_event 	*cre = arg;
+	struct http_descriptor 	*desc = cre->desc;
+	struct rsession 	*con = cre->con;
+	struct evbuffer 	*src = EVBUFFER_INPUT(bev);
+	int 			rc = 0;
+	int 			stop = 0;
+	int			try_splice = 0;
+
+	do {
+		switch (desc->http_state) {
+		case HTTP_STATE_READ_HEADER:
+			rc = relay_read_http(bev, arg);
+			if (rc != -1 && desc->http_state == HTTP_STATE_READ_HEADER) {
+				// The state does not change, so it can stop here
+				// this mean the http headers has not been fully parsed
+				// because there is not enough data available
+				stop = 1;
+				try_splice = 1;
+			}
+			break;
+		case HTTP_STATE_READ_CONTENT:
+			rc = relay_read_httpcontent(bev, arg);
+			if (rc != -1 && desc->http_state == HTTP_STATE_READ_CONTENT) {
+				// The state does not change, so it can stop here
+				stop = 1;
+				try_splice = 0;
+			}
+			break;
+		case HTTP_STATE_READ_CHUNKS:
+			rc = relay_read_httpchunks(bev, arg);
+			try_splice = 0;
+			break;
+		case HTTP_STATE_READ_DATA:
+			relay_read(bev, arg);
+			return;
+		}
+	} while (!stop && rc == 0 && EVBUFFER_LENGTH(src));
+
+	if (rc == 0) {
+		bufferevent_enable(bev, EV_READ);
+		if (try_splice && relay_splice(cre) == -1)
+			relay_close(con, strerror(errno));
+	}
+}
+
+int
 relay_read_http(struct bufferevent *bev, void *arg)
 {
 	struct ctl_relay_event	*cre = arg;
@@ -174,7 +221,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	    __func__, con->se_id, size, cre->toread);
 	if (!size) {
 		if (cre->dir == RELAY_DIR_RESPONSE)
-			return;
+			return 1;
 		cre->toread = TOREAD_HTTP_HEADER;
 		goto done;
 	}
@@ -198,7 +245,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		if (cre->headerlen > RELAY_MAXHEADERLENGTH) {
 			free(line);
 			relay_abort_http(con, 413, "request too large", 0);
-			return;
+			return -1;
 		}
 
 		/*
@@ -216,7 +263,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			if (cre->line == 1) {
 				free(line);
 				relay_abort_http(con, 400, "malformed", 0);
-				return;
+				return -1;
 			}
 
 			/* Append line to the last header, if present */
@@ -354,23 +401,23 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	if (cre->done) {
 		if (desc->http_method == HTTP_METHOD_NONE) {
 			relay_abort_http(con, 406, "no method", 0);
-			return;
+			return -1;
 		}
 
 		action = relay_test(proto, cre);
 		if (action == RES_FAIL) {
 			relay_close(con, "filter rule failed");
-			return;
+			return -1;
 		} else if (action != RES_PASS) {
 			relay_abort_http(con, 403, "Forbidden", con->se_label);
-			return;
+			return -1;
 		}
 
 		switch (desc->http_method) {
 		case HTTP_METHOD_CONNECT:
 			/* Data stream */
 			cre->toread = TOREAD_UNLIMITED;
-			bev->readcb = relay_read;
+			desc->http_state = HTTP_STATE_READ_DATA;
 			break;
 		case HTTP_METHOD_DELETE:
 		case HTTP_METHOD_GET:
@@ -383,24 +430,24 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		case HTTP_METHOD_RESPONSE:
 			/* HTTP request payload */
 			if (cre->toread > 0)
-				bev->readcb = relay_read_httpcontent;
+				desc->http_state = HTTP_STATE_READ_CONTENT;
 
 			/* Single-pass HTTP body */
 			if (cre->toread < 0) {
 				cre->toread = TOREAD_UNLIMITED;
-				bev->readcb = relay_read;
+				desc->http_state = HTTP_STATE_READ_DATA;
 			}
 			break;
 		default:
 			/* HTTP handler */
 			cre->toread = TOREAD_HTTP_HEADER;
-			bev->readcb = relay_read_http;
+			desc->http_state = HTTP_STATE_READ_HEADER;
 			break;
 		}
 		if (desc->http_chunked) {
 			/* Chunked transfer encoding */
 			cre->toread = TOREAD_HTTP_CHUNK_LENGTH;
-			bev->readcb = relay_read_httpchunks;
+			desc->http_state = HTTP_STATE_READ_CHUNKS;
 		}
 
 		if (cre->dir == RELAY_DIR_REQUEST) {
@@ -421,35 +468,32 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		    cre->dst->bev == NULL) {
 			if (rlay->rl_conf.fwdmode == FWD_TRANS) {
 				relay_bindanyreq(con, 0, IPPROTO_TCP);
-				return;
+				return -1;
 			}
 			if (relay_connect(con) == -1) {
 				relay_abort_http(con, 502, "session failed", 0);
-				return;
+				return -1;
 			}
 		}
 	}
 	if (con->se_done) {
 		relay_close(con, "last http read (done)");
-		return;
+		return -1;
 	}
-	if (EVBUFFER_LENGTH(src) && bev->readcb != relay_read_http)
-		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
-	if (relay_splice(cre) == -1)
-		relay_close(con, strerror(errno));
-	return;
+	return 0;
  fail:
 	relay_abort_http(con, 500, strerror(errno), 0);
-	return;
+	return -1;
  abort:
 	free(line);
+	return -1;
 }
 
-void
+int
 relay_read_httpcontent(struct bufferevent *bev, void *arg)
 {
 	struct ctl_relay_event	*cre = arg;
+	struct http_descriptor	*desc = cre->desc;
 	struct rsession		*con = cre->con;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	size_t			 size;
@@ -461,7 +505,7 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
 	    con->se_id, size, cre->toread);
 	if (!size)
-		return;
+		return 1;
 	if (relay_spliceadjust(cre) == -1)
 		goto fail;
 
@@ -483,25 +527,24 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 	}
 	if (cre->toread == 0) {
 		cre->toread = TOREAD_HTTP_HEADER;
-		bev->readcb = relay_read_http;
+		desc->http_state = HTTP_STATE_READ_HEADER;
 	}
 	if (con->se_done)
 		goto done;
-	if (bev->readcb != relay_read_httpcontent)
-		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
-	return;
+	return 0;
  done:
 	relay_close(con, "last http content read");
-	return;
+	return -1;
  fail:
 	relay_close(con, strerror(errno));
+	return -1;
 }
 
-void
+int
 relay_read_httpchunks(struct bufferevent *bev, void *arg)
 {
 	struct ctl_relay_event	*cre = arg;
+	struct http_descriptor	*desc = cre->desc;
 	struct rsession		*con = cre->con;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 	char			*line;
@@ -515,7 +558,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 	DPRINTF("%s: session %d: size %lu, to read %lld", __func__,
 	    con->se_id, size, cre->toread);
 	if (!size)
-		return;
+		return 1;
 	if (relay_spliceadjust(cre) == -1)
 		goto fail;
 
@@ -541,7 +584,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		if (line == NULL) {
 			/* Ignore empty line, continue */
 			bufferevent_enable(bev, EV_READ);
-			return;
+			return 1;
 		}
 		if (strlen(line) == 0) {
 			free(line);
@@ -555,7 +598,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		if (sscanf(line, "%llx", &llval) != 1 || llval < 0) {
 			free(line);
 			relay_close(con, "invalid chunk size");
-			return;
+			return -1;
 		}
 
 		if (relay_bufferevent_print(cre->dst, line) == -1 ||
@@ -576,7 +619,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		if (line == NULL) {
 			/* Ignore empty line, continue */
 			bufferevent_enable(bev, EV_READ);
-			return;
+			return -1;
 		}
 		if (relay_bufferevent_print(cre->dst, line) == -1 ||
 		    relay_bufferevent_print(cre->dst, "\r\n") == -1) {
@@ -586,7 +629,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		if (strlen(line) == 0) {
 			/* Switch to HTTP header mode */
 			cre->toread = TOREAD_HTTP_HEADER;
-			bev->readcb = relay_read_http;
+			desc->http_state = HTTP_STATE_READ_HEADER;
 		}
 		free(line);
 		break;
@@ -604,16 +647,14 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
  next:
 	if (con->se_done)
 		goto done;
-	if (EVBUFFER_LENGTH(src))
-		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
-	return;
+	return 0;
 
  done:
 	relay_close(con, "last http chunk read (done)");
-	return;
+	return -1;
  fail:
 	relay_close(con, strerror(errno));
+	return -1;
 }
 
 void
