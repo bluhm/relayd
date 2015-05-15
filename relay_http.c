@@ -434,11 +434,17 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		relay_close(con, "last http read (done)");
 		return;
 	}
+	switch (relay_splice(cre)) {
+	case -1:
+		relay_close(con, strerror(errno));
+		return;
+	case 1:
+		return;
+	}
+	bufferevent_enable(bev, EV_READ);
 	if (EVBUFFER_LENGTH(src) && bev->readcb != relay_read_http)
 		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
-	if (relay_splice(cre) == -1)
-		relay_close(con, strerror(errno));
+	/* readcb() might have freed the session */
 	return;
  fail:
 	relay_abort_http(con, 500, strerror(errno), 0);
@@ -488,9 +494,10 @@ relay_read_httpcontent(struct bufferevent *bev, void *arg)
 	}
 	if (con->se_done)
 		goto done;
+	bufferevent_enable(bev, EV_READ);
 	if (bev->readcb != relay_read_httpcontent)
 		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
+	/* readcb() might have freed the session */
 	return;
  done:
 	relay_close(con, "last http content read");
@@ -605,9 +612,10 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
  next:
 	if (con->se_done)
 		goto done;
+	bufferevent_enable(bev, EV_READ);
 	if (EVBUFFER_LENGTH(src))
 		bev->readcb(bev, arg);
-	bufferevent_enable(bev, EV_READ);
+	/* readcb() might have freed the session */
 	return;
 
  done:
