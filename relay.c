@@ -878,7 +878,7 @@ relay_splice(struct ctl_relay_event *cre)
 	DPRINTF("%s: session %d: splice dir %d, maximum %lld, successful",
 	    __func__, con->se_id, cre->dir, cre->toread);
 
-	return (0);
+	return (1);
 }
 
 int
