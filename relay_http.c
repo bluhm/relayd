@@ -149,6 +149,7 @@ relay_httpdesc_free(struct http_descriptor *desc)
 		desc->query_val = NULL;
 	}
 	kv_purge(&desc->http_headers);
+	desc->http_lastheader = NULL;
 }
 
 void
@@ -340,7 +341,6 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		    strcasecmp("chunked", value) == 0)
 			desc->http_chunked = 1;
 
-		desc->http_lastheader = NULL;
 		if (cre->line != 1) {
 			if ((hdr = kv_add(&desc->http_headers, key,
 			    value)) == NULL) {
