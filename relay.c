@@ -829,6 +829,12 @@ relay_read(struct bufferevent *bev, void *arg)
 	relay_close(con, strerror(errno));
 }
 
+/*
+ * Splice sockets from cre to cre->dst if applicable.  Returns:
+ * -1 socket splicing has failed
+ * 0 socket splicing is currently not possible
+ * 1 socket splicing was successful
+ */
 int
 relay_splice(struct ctl_relay_event *cre)
 {
