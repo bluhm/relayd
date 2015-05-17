@@ -437,9 +437,10 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	switch (relay_splice(cre)) {
 	case -1:
 		relay_close(con, strerror(errno));
-		return;
 	case 1:
 		return;
+	case 0:
+		break;
 	}
 	bufferevent_enable(bev, EV_READ);
 	if (EVBUFFER_LENGTH(src) && bev->readcb != relay_read_http)
