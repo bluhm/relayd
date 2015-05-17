@@ -865,7 +865,10 @@ relay_splice(struct ctl_relay_event *cre)
 
 	bzero(&sp, sizeof(sp));
 	sp.sp_fd = cre->dst->s;
-	sp.sp_max = cre->toread > 0 ? cre->toread : 0;
+	if (cre->toread > 0)
+		sp.sp_max = cre->toread;
+	if (proto->tcprate > 0)
+		sp.sp_rate = proto->tcprate;
 	bcopy(&rlay->rl_conf.timeout, &sp.sp_idle, sizeof(sp.sp_idle));
 	if (setsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &sp, sizeof(sp)) == -1) {
 		log_debug("%s: session %d: splice dir %d failed: %s",
