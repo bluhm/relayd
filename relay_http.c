@@ -214,7 +214,7 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		else
 			value = strchr(key, ':');
 		if (value == NULL) {
-			if (cre->line == 1 || cre->line == 2) {
+			if (cre->line <= 2) {
 				free(line);
 				relay_abort_http(con, 400, "malformed", 0);
 				return;
