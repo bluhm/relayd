@@ -552,6 +552,7 @@ struct rsession {
 	int				 se_bnds;
 	u_int16_t			 se_tag;
 	u_int16_t			 se_label;
+	off_t				 se_rate;
 
 	int				 se_cid;
 	pid_t				 se_pid;

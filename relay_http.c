@@ -1380,6 +1380,9 @@ relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
 	if (rule->rule_label != 0)
 		con->se_label = rule->rule_label == -1 ? 0 : rule->rule_label;
 
+	if (rule->rule_rate > 0)
+		con->se_rate = rule->rule_rate;
+
 	/*
 	 * Apply the remaining options once after evaluation.
 	 */
