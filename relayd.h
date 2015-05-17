@@ -621,6 +621,7 @@ struct relay_rule {
 	int			 rule_label;
 	int			 rule_tag;
 	int			 rule_tagged;
+	off_t			 rule_rate;
 	enum direction		 rule_dir;
 	u_int			 rule_proto;
 	int			 rule_af;

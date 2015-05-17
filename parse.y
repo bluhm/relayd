@@ -1545,6 +1545,12 @@ ruleopts	: METHOD STRING					{
 				rule->rule_kv[keytype].kv_value = NULL;
 			rulefile = $2;
 		}
+		| RATE NUMBER					{
+			if ((rule->rule_rate = $2) <= 0) {
+				yyerror("invalid rate limit: %d", $2);
+				YYERROR;
+			}
+		}
 		;
 
 value		: /* empty */		{ $$ = NULL; }
