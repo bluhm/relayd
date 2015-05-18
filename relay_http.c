@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_http.c,v 1.45 2015/05/18 16:45:16 bluhm Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.46 2015/05/18 16:57:20 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
