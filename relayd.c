@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.139 2015/05/02 13:15:24 claudio Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.141 2015/05/30 09:47:25 claudio Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -408,6 +408,7 @@ parent_shutdown(struct relayd *env)
 
 	proc_kill(env->sc_ps);
 	control_cleanup(&env->sc_ps->ps_csock);
+	(void)unlink(env->sc_ps->ps_csock.cs_name);
 	carp_demote_shutdown();
 
 	free(env->sc_ps);
@@ -767,18 +768,13 @@ kv_purge(struct kvtree *keys)
 void
 kv_free(struct kv *kv)
 {
-	if (kv->kv_type == KEY_TYPE_NONE)
-		return;
-	if (kv->kv_key != NULL) {
-		free(kv->kv_key);
-	}
-	kv->kv_key = NULL;
-	if (kv->kv_value != NULL) {
-		free(kv->kv_value);
-	}
-	kv->kv_value = NULL;
-	kv->kv_matchtree = NULL;
-	kv->kv_match = NULL;
+	/*
+	 * This function does not clear memory referenced by
+	 * kv_children or stuff on the tailqs. Use kv_delete() instead.
+	 */
+
+	free(kv->kv_key);
+	free(kv->kv_value);
 	memset(kv, 0, sizeof(*kv));
 }
 
