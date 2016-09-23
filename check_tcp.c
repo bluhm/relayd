@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_tcp.c,v 1.46 2015/01/22 17:42:09 reyk Exp $	*/
+/*	$OpenBSD: check_tcp.c,v 1.51 2016/01/11 21:31:42 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -67,7 +67,8 @@ check_tcp(struct ctl_tcp_event *cte)
 
 	len = ((struct sockaddr *)&cte->host->conf.ss)->sa_len;
 
-	if ((s = socket(cte->host->conf.ss.ss_family, SOCK_STREAM, 0)) == -1) {
+	if ((s = socket(cte->host->conf.ss.ss_family,
+	    SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1) {
 		if (errno == EMFILE || errno == ENFILE)
 			he = HCE_TCP_SOCKET_LIMIT;
 		else
@@ -86,9 +87,6 @@ check_tcp(struct ctl_tcp_event *cte)
 		    &cte->host->conf.ttl, sizeof(int)) == -1)
 			goto bad;
 	}
-
-	if (fcntl(s, F_SETFL, O_NONBLOCK) == -1)
-		goto bad;
 
 	bcopy(&cte->table->conf.timeout, &tv, sizeof(tv));
 	if (connect(s, (struct sockaddr *)&cte->host->conf.ss, len) == -1) {
@@ -143,10 +141,8 @@ tcp_close(struct ctl_tcp_event *cte, int status)
 	cte->s = -1;
 	if (status != 0)
 		cte->host->up = status;
-	if (cte->buf) {
-		ibuf_free(cte->buf);
-		cte->buf = NULL;
-	}
+	ibuf_free(cte->buf);
+	cte->buf = NULL;
 }
 
 void
@@ -322,6 +318,7 @@ check_http_code(struct ctl_tcp_event *cte)
 	head = cte->buf->buf;
 	host = cte->host;
 	host->he = HCE_HTTP_CODE_ERROR;
+	host->code = 0;
 
 	if (strncmp(head, "HTTP/1.1 ", strlen("HTTP/1.1 ")) &&
 	    strncmp(head, "HTTP/1.0 ", strlen("HTTP/1.0 "))) {
@@ -344,10 +341,11 @@ check_http_code(struct ctl_tcp_event *cte)
 		return (1);
 	}
 	if (code != cte->table->conf.retcode) {
-		log_debug("%s: %s failed (invalid HTTP code returned)",
-		    __func__, host->conf.name);
+		log_debug("%s: %s failed (invalid HTTP code %d returned)",
+		    __func__, host->conf.name, code);
 		host->he = HCE_HTTP_CODE_FAIL;
 		host->up = HOST_DOWN;
+		host->code = code;
 	} else {
 		host->he = HCE_HTTP_CODE_OK;
 		host->up = HOST_UP;
