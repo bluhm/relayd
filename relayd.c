@@ -245,6 +245,7 @@ main(int argc, char *argv[])
 
 	proc_connect(ps);
 
+	relay_http(NULL);
 	if (load_config(env->sc_conffile, env) == -1) {
 		proc_kill(env->sc_ps);
 		exit(1);
