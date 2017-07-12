@@ -234,9 +234,11 @@ ca_dispatch_relay(int fd, struct privsep_proc *p, struct imsg *imsg)
 			fatalx("%s: invalid relay proc", __func__);
 		if (IMSG_DATA_SIZE(imsg) != (sizeof(cko) + cko.cko_flen))
 			fatalx("%s: invalid key operation", __func__);
-		if ((pkey = pkey_find(env, cko.cko_hash)) == NULL ||
-		    (rsa = EVP_PKEY_get1_RSA(pkey)) == NULL)
-			fatalx("%s: invalid relay key or id", __func__);
+		if ((pkey = pkey_find(env, cko.cko_hash)) == NULL)
+			fatalx("%s: invalid relay hash '%s'",
+			    __func__, cko.cko_hash);
+		if ((rsa = EVP_PKEY_get1_RSA(pkey)) == NULL)
+			fatalx("%s: invalid relay key", __func__);
 
 		DPRINTF("%s:%d: key hash %s proc %d",
 		    __func__, __LINE__, cko.cko_hash, cko.cko_proc);
