@@ -2100,12 +2100,12 @@ relay_tls_ctx_create(struct relay *rlay)
 
 		if (rlay->rl_conf.tls_cacert_len) {
 			log_debug("%s: loading CA certificate", __func__);
-			if (!ssl_load_pkey(&rlay->rl_conf.tls_cakeyid,
+			if (!ssl_load_pkey(
 			    rlay->rl_tls_cacert, rlay->rl_conf.tls_cacert_len,
 			    &rlay->rl_tls_cacertx509, &rlay->rl_tls_capkey))
 				goto err;
 			/* loading certificate public key */
-			if (!ssl_load_pkey(NULL,
+			if (!ssl_load_pkey(
 			    rlay->rl_tls_cert, rlay->rl_conf.tls_cert_len,
 			    NULL, &rlay->rl_tls_pkey))
 				goto err;
