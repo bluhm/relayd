@@ -103,7 +103,7 @@ hash_string(char *d, size_t dlen, char *hash, size_t hashlen)
 void
 ca_launch(void)
 {
-	char		 d[EVP_MAX_MD_SIZE], hash[TLS_CERT_HASH_SIZE];
+	char		 d[EVP_MAX_MD_SIZE];
 	BIO		*in = NULL;
 	EVP_PKEY	*pkey = NULL;
 	struct relay	*rlay;
@@ -114,6 +114,7 @@ ca_launch(void)
 		if ((rlay->rl_conf.flags & (F_TLS|F_TLSCLIENT)) == 0)
 			continue;
 
+		memset(rlay->rl_tls_hash, 0, TLS_CERT_HASH_SIZE);
 		if (rlay->rl_conf.tls_cert_len) {
 			if ((in = BIO_new_mem_buf(rlay->rl_tls_cert,
 			    rlay->rl_conf.tls_cert_len)) == NULL)
@@ -126,7 +127,8 @@ ca_launch(void)
 			if (X509_digest(cert, EVP_sha256(), d, &dlen) != 1)
 				fatalx("ca_launch: cert");
 
-			hash_string(d, dlen, hash, sizeof(hash));
+			hash_string(d, dlen, rlay->rl_tls_hash,
+			    TLS_CERT_HASH_SIZE);
 
 			BIO_free(in);
 			X509_free(cert);
@@ -145,13 +147,14 @@ ca_launch(void)
 
 			rlay->rl_tls_pkey = pkey;
 
-			if (pkey_add(env, pkey, hash) == NULL)
+			if (pkey_add(env, pkey, rlay->rl_tls_hash) == NULL)
 				fatalx("tls pkey");
 
 			purge_key(&rlay->rl_tls_key,
 			    rlay->rl_conf.tls_key_len);
 		}
 
+		memset(rlay->rl_tls_cahash, 0, TLS_CERT_HASH_SIZE);
 		if (rlay->rl_conf.tls_cacert_len) {
 			if ((in = BIO_new_mem_buf(rlay->rl_tls_cacert,
 			    rlay->rl_conf.tls_cacert_len)) == NULL)
@@ -164,7 +167,8 @@ ca_launch(void)
 			if (X509_digest(cert, EVP_sha256(), d, &dlen) != 1)
 				fatalx("ca_launch: cacert");
 
-			hash_string(d, dlen, hash, sizeof(hash));
+			hash_string(d, dlen, rlay->rl_tls_cahash,
+			    TLS_CERT_HASH_SIZE);
 
 			BIO_free(in);
 			X509_free(cert);
@@ -183,7 +187,7 @@ ca_launch(void)
 
 			rlay->rl_tls_capkey = pkey;
 
-			if (pkey_add(env, pkey, hash) == NULL)
+			if (pkey_add(env, pkey, rlay->rl_tls_cahash) == NULL)
 				fatalx("ca pkey");
 
 			purge_key(&rlay->rl_tls_cakey,

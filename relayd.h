@@ -790,11 +790,13 @@ struct relay {
 	char			*rl_tls_cert;
 	char			*rl_tls_key;
 	EVP_PKEY		*rl_tls_pkey;
+	char			 rl_tls_hash[TLS_CERT_HASH_SIZE];
 	char			*rl_tls_ca;
 	char			*rl_tls_cacert;
 	X509			*rl_tls_cacertx509;
 	char			*rl_tls_cakey;
 	EVP_PKEY		*rl_tls_capkey;
+	char			 rl_tls_cahash[TLS_CERT_HASH_SIZE];
 
 	struct ctl_stats	 rl_stats[PROC_MAX_INSTANCES + 1];
 
