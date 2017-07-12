@@ -2207,6 +2207,10 @@ relay_tls_transaction(struct rsession *con, struct ctl_relay_event *cre)
 			tls_server = relay_tls_inspect_create(rlay, cre);
 		else
 			tls_server = rlay->rl_tls_ctx;
+		if (tls_server == NULL) {
+			errstr = "no TLS server context available";
+			goto err;
+		}
 
 		if (tls_accept_socket(tls_server, &cre->tls, cre->s) == -1) {
 			errstr = "could not accept the TLS connection";
