@@ -2163,6 +2163,8 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 	tls_config_skip_private_key_check(tls_cfg);
 
 	log_debug("%s: loading intercepted certificate", __func__);
+	tls_config_skip_private_key_check(tls_cfg);
+
 	if ((fake_keylen = ssl_ctx_fake_private_key(cre->tlscert,
 	    cre->tlscert_len, &fake_key)) == -1) {
 		/* error already printed */
