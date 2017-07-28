@@ -2030,8 +2030,8 @@ void tls_config_skip_private_key_check(struct tls_config *config);
 int
 relay_tls_ctx_create(struct relay *rlay)
 {
-	struct tls_config	*tls_cfg, *tls_client_cfg;
-	struct tls		*tls = NULL;
+	struct tls_config	*tls_cfg = NULL, *tls_client_cfg = NULL;
+	struct tls		*tls;
 	const char		*fake_key;
 	int			 fake_keylen;
 
@@ -2070,6 +2070,7 @@ relay_tls_ctx_create(struct relay *rlay)
 		}
 
 		rlay->rl_tls_client_cfg = tls_client_cfg;
+		tls_client_cfg = NULL;
 	}
 
 	if (rlay->rl_conf.flags & F_TLS) {
@@ -2123,6 +2124,7 @@ relay_tls_ctx_create(struct relay *rlay)
 			goto err;
 		}
 		rlay->rl_tls_cfg = tls_cfg;
+		tls_cfg = NULL;
 		rlay->rl_tls_ctx = tls;
 	}
 
@@ -2130,11 +2132,8 @@ relay_tls_ctx_create(struct relay *rlay)
 	purge_key(&rlay->rl_tls_cert, rlay->rl_conf.tls_cert_len);
 	purge_key(&rlay->rl_tls_cacert, rlay->rl_conf.tls_cacert_len);
 
-	if (rlay->rl_tls_client_cfg == NULL)
-		tls_config_free(tls_client_cfg);
-	if (rlay->rl_tls_cfg == NULL)
-		tls_config_free(tls_cfg);
-
+	tls_config_free(tls_client_cfg);
+	tls_config_free(tls_cfg);
 	return (0);
  err:
 	tls_config_free(tls_client_cfg);
