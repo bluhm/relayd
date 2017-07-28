@@ -2182,7 +2182,7 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 		goto err;
 	}
 	if (tls_configure(tls, tls_cfg) == -1) {
-		log_warnx("could not configure the TLS context: %s",
+		log_warnx("could not configure intercept TLS context: %s",
 		    tls_error(tls));
 		tls_free(tls);
 		goto err;
