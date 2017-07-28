@@ -2146,7 +2146,7 @@ relay_tls_ctx_create(struct relay *rlay)
 static struct tls *
 relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 {
-	struct tls_config	*tls_cfg;
+	struct tls_config	*tls_cfg = NULL;
 	struct tls		*tls;
 	const char		*fake_key;
 	int			 fake_keylen;
