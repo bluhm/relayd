@@ -2155,9 +2155,8 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 		log_warnx("unable to allocate TLS config");
 		goto err;
 	}
-	if (relay_tls_ctx_create_proto(rlay->rl_proto,
-	    tls_cfg) == -1) {
-		tls_config_free(tls_cfg);
+	if (relay_tls_ctx_create_proto(rlay->rl_proto, tls_cfg) == -1) {
+		/* error already printed */
 		goto err;
 	}
 
