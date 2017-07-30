@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.223 2017/07/28 13:58:52 bluhm Exp $	*/
+/*	$OpenBSD: relay.c,v 1.224 2017/07/30 09:33:08 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
