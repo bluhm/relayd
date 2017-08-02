@@ -2105,6 +2105,7 @@ relay_tls_ctx_create(struct relay *rlay)
 			    &rlay->rl_tls_cacertx509, &rlay->rl_tls_capkey))
 				goto err;
 			/* loading certificate public key */
+			log_debug("%s: loading certificate", __func__);
 			if (!ssl_load_pkey(
 			    rlay->rl_tls_cert, rlay->rl_conf.tls_cert_len,
 			    NULL, &rlay->rl_tls_pkey))
@@ -2159,6 +2160,8 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 		/* error already printed */
 		goto err;
 	}
+
+	tls_config_skip_private_key_check(tls_cfg);
 
 	log_debug("%s: loading intercepted certificate", __func__);
 	if ((fake_keylen = ssl_ctx_fake_private_key(cre->tlscert,
