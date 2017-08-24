@@ -788,9 +788,12 @@ relay_write(struct bufferevent *bev, void *arg)
 {
 	struct ctl_relay_event	*cre = arg;
 	struct rsession		*con = cre->con;
+	struct evbuffer		*dst = EVBUFFER_OUTPUT(bev);
 
 	getmonotime(&con->se_tv_last);
 
+	if (EVBUFFER_LENGTH(dst))
+		return;
 	if (con->se_done)
 		goto done;
 	if (relay_splice(cre->dst) == -1)
