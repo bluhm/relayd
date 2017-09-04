@@ -343,7 +343,8 @@ config_gettable(struct relayd *env, struct imsg *imsg)
 			free(tb);
 			return (-1);
 		}
-	}
+	} else
+		tb->sendbuf = NULL;
 
 	TAILQ_INIT(&tb->hosts);
 	TAILQ_INSERT_TAIL(env->sc_tables, tb, entry);
@@ -685,7 +686,8 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 			free(proto);
 			return (-1);
 		}
-	}
+	} else
+		proto->style = NULL;
 
 	TAILQ_INIT(&proto->rules);
 	proto->tlscapass = NULL;
