@@ -1055,6 +1055,11 @@ httpflags_l	: httpflags comma httpflags_l
 		;
 
 httpflags	: HEADERLEN NUMBER	{
+			if (proto->type != RELAY_PROTO_HTTP) {
+				yyerror("can set http options only for "
+				    "http protocol");
+				YYERROR;
+			}
 			if ($2 < 0 || $2 > RELAY_MAXHEADERLENGTH) {
 				yyerror("invalid headerlen: %d", $2);
 				YYERROR;
