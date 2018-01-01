@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.231 2017/11/27 21:09:55 claudio Exp $	*/
+/*	$OpenBSD: relay.c,v 1.237 2017/12/27 15:53:30 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -661,6 +661,7 @@ relay_connected(int fd, short sig, void *arg)
 	evbuffercb		 outwr = relay_write;
 	struct bufferevent	*bev;
 	struct ctl_relay_event	*out = &con->se_out;
+	char			*msg;
 	socklen_t		 len;
 	int			 error;
 
@@ -670,12 +671,22 @@ relay_connected(int fd, short sig, void *arg)
 	}
 
 	len = sizeof(error);
-	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error,
-	    &len) == -1 || error) {
-		if (error)
-			errno = error;
-		relay_abort_http(con, 500, "socket error", 0);
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == -1) {
+		relay_abort_http(con, 500, "getsockopt failed", 0);
 		return;
+	}
+	if (error) {
+		errno = error;
+		if (asprintf(&msg, "socket error: %s",
+		    strerror(error)) >= 0) {
+			relay_abort_http(con, 500, msg, 0);
+			free(msg);
+			return;
+		} else {
+			relay_abort_http(con, 500,
+			    "socket error and asprintf failed", 0);
+			return;
+		}
 	}
 
 	if ((rlay->rl_conf.flags & F_TLSCLIENT) && (out->tls == NULL)) {
@@ -964,7 +975,7 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 	struct rsession		*con = cre->con;
 	struct evbuffer		*dst;
 
-	DPRINTF("%s: session %d: dir %d state %d toread %lld event error %x",
+	DPRINTF("%s: session %d: dir %d state %d to read %lld event error %x",
 		__func__, con->se_id, cre->dir, cre->state, cre->toread, error);
 	if (error & EVBUFFER_TIMEOUT) {
 		if (cre->splicelen >= 0) {
@@ -1698,17 +1709,8 @@ relay_close(struct rsession *con, const char *msg)
 		(*proto->close)(con);
 
 	free(con->se_priv);
-	if (con->se_in.bev != NULL)
-		bufferevent_free(con->se_in.bev);
-	if (con->se_in.output != NULL)
-		evbuffer_free(con->se_in.output);
-	if (con->se_in.tls != NULL)
-		tls_close(con->se_in.tls);
-	tls_free(con->se_in.tls);
-	tls_config_free(con->se_in.tls_cfg);
-	free(con->se_in.tlscert);
-	if (con->se_in.s != -1) {
-		close(con->se_in.s);
+
+	if (relay_reset_event(&con->se_in)) {
 		if (con->se_out.s == -1) {
 			/*
 			 * the output was never connected,
@@ -1719,26 +1721,18 @@ relay_close(struct rsession *con, const char *msg)
 			    __func__, relay_inflight);
 		}
 	}
+	if (con->se_in.output != NULL)
+		evbuffer_free(con->se_in.output);
 
-	if (con->se_out.bev != NULL)
-		bufferevent_free(con->se_out.bev);
-	if (con->se_out.output != NULL)
-		evbuffer_free(con->se_out.output);
-	if (con->se_out.tls != NULL)
-		tls_close(con->se_out.tls);
-	tls_free(con->se_out.tls);
-	tls_config_free(con->se_out.tls_cfg);
-	free(con->se_out.tlscert);
-	if (con->se_out.s != -1) {
-		close(con->se_out.s);
-
+	if (relay_reset_event(&con->se_out)) {
 		/* Some file descriptors are available again. */
 		if (evtimer_pending(&rlay->rl_evt, NULL)) {
 			evtimer_del(&rlay->rl_evt);
 			event_add(&rlay->rl_ev, NULL);
 		}
 	}
-	con->se_out.state = STATE_INIT;
+	if (con->se_out.output != NULL)
+		evbuffer_free(con->se_out.output);
 
 	if (con->se_log != NULL)
 		evbuffer_free(con->se_log);
@@ -1753,6 +1747,35 @@ relay_close(struct rsession *con, const char *msg)
 
 	free(con);
 	relay_sessions--;
+}
+
+int
+relay_reset_event(struct ctl_relay_event *cre)
+{
+	int		 rv = 0;
+
+	DPRINTF("%s: state %d dir %d", __func__, cre->state, cre->dir);
+
+	if (cre->bev != NULL)
+		bufferevent_free(cre->bev);
+	if (cre->tls != NULL)
+		tls_close(cre->tls);
+	tls_free(cre->tls);
+	tls_free(cre->tls_ctx);
+	tls_config_free(cre->tls_cfg);
+	free(cre->tlscert);
+	if (cre->s != -1) {
+		close(cre->s);
+		rv = 1;
+	}
+	cre->state = STATE_DONE;
+	cre->bev = NULL;
+	cre->tls = NULL;
+	cre->tls_cfg = NULL;
+	cre->tlscert = NULL;
+	cre->s = -1;
+
+	return (rv);
 }
 
 int
@@ -2013,9 +2036,9 @@ relay_tls_ctx_create_proto(struct protocol *proto, struct tls_config *tls_cfg)
 		    sizeof(env->sc_ticket.tt_key));
 	}
 
-	if (tls_config_set_ecdhecurve(tls_cfg, proto->tlsecdhcurve) != 0) {
-		log_warnx("failed to set ecdh curve %s: %s",
-		    proto->tlsecdhcurve, tls_config_error(tls_cfg));
+	if (tls_config_set_ecdhecurves(tls_cfg, proto->tlsecdhecurves) != 0) {
+		log_warnx("failed to set ecdhe curves %s: %s",
+		    proto->tlsecdhecurves, tls_config_error(tls_cfg));
 		return (-1);
 	}
 
@@ -2177,7 +2200,7 @@ static struct tls *
 relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 {
 	struct tls_config	*tls_cfg;
-	struct tls		*tls;
+	struct tls		*tls = NULL;
 	const char		*fake_key;
 	int			 fake_keylen;
 
@@ -2220,6 +2243,7 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 	}
 
 	cre->tls_cfg = tls_cfg;
+	cre->tls_ctx = tls;
 	return (tls);
  err:
 	tls_config_free(tls_cfg);
@@ -2248,8 +2272,6 @@ relay_tls_transaction(struct rsession *con, struct ctl_relay_event *cre)
 			errstr = "could not accept the TLS connection";
 			goto err;
 		}
-		if (cre->tlscert != NULL)
-			tls_free(tls_server);
 		flag = EV_READ;
 	} else {
 		cre->tls = tls_client();
@@ -2580,15 +2602,14 @@ relay_load_fd(int fd, off_t *len)
 	struct stat	 st;
 	off_t		 size;
 	ssize_t		 rv;
+	int		 err;
 
 	if (fstat(fd, &st) != 0)
 		goto fail;
 	size = st.st_size;
 	if ((buf = calloc(1, size + 1)) == NULL)
 		goto fail;
-	if (lseek(fd, 0, SEEK_SET) != 0)
-		goto fail;
-	if ((rv = read(fd, buf, size)) != size)
+	if ((rv = pread(fd, buf, size, 0)) != size)
 		goto fail;
 
 	close(fd);
@@ -2597,8 +2618,10 @@ relay_load_fd(int fd, off_t *len)
 	return (buf);
 
  fail:
+	err = errno;
 	free(buf);
 	close(fd);
+	errno = err;
 	return (NULL);
 }
 

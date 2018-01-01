@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.244 2017/11/27 21:06:26 claudio Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.248 2017/11/28 18:25:53 claudio Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -192,7 +192,8 @@ enum relay_state {
 	STATE_INIT,
 	STATE_PENDING,
 	STATE_PRECONNECT,
-	STATE_CONNECTED
+	STATE_CONNECTED,
+	STATE_DONE
 };
 
 struct ctl_relay_event {
@@ -206,6 +207,7 @@ struct ctl_relay_event {
 
 	struct tls		*tls;
 	struct tls_config	*tls_cfg;
+	struct tls		*tls_ctx;
 
 	uint8_t			*tlscert;
 	size_t			 tlscert_len;
@@ -691,7 +693,7 @@ TAILQ_HEAD(relay_rules, relay_rule);
 	"\06cipher-server-preference\07client-renegotiation"
 
 #define TLSCIPHERS_DEFAULT	"HIGH:!aNULL"
-#define TLSECDHCURVE_DEFAULT	"auto"
+#define TLSECDHECURVES_DEFAULT	"default"
 #define TLSDHPARAM_DEFAULT	"none"
 
 struct relay_ticket_key {
@@ -712,7 +714,7 @@ struct protocol {
 	u_int8_t		 tlsflags;
 	char			 tlsciphers[768];
 	char			 tlsdhparams[128];
-	char			 tlsecdhcurve[128];
+	char			 tlsecdhecurves[128];
 	char			 tlsca[PATH_MAX];
 	char			 tlscacert[PATH_MAX];
 	char			 tlscakey[PATH_MAX];
@@ -969,7 +971,7 @@ enum imsg_type {
 	IMSG_CFG_DONE,
 	IMSG_CA_PRIVENC,
 	IMSG_CA_PRIVDEC,
-	IMSG_SESS_PUBLISH,	/* from relay to hce */
+	IMSG_SESS_PUBLISH,	/* from relay to pfe */
 	IMSG_SESS_UNPUBLISH,
 	IMSG_TLSTICKET_REKEY
 };
@@ -1172,6 +1174,7 @@ int	 relay_session_cmp(struct rsession *, struct rsession *);
 char	*relay_load_fd(int, off_t *);
 int	 relay_load_certfiles(struct relay *);
 void	 relay_close(struct rsession *, const char *);
+int	 relay_reset_event(struct ctl_relay_event *);
 void	 relay_natlook(int, short, void *);
 void	 relay_session(struct rsession *);
 int	 relay_from_table(struct rsession *);
