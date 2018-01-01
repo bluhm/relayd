@@ -1,4 +1,4 @@
-/*	$OpenBSD: ca.c,v 1.29 2017/11/27 21:06:25 claudio Exp $	*/
+/*	$OpenBSD: ca.c,v 1.30 2017/11/27 23:05:50 bluhm Exp $	*/
 
 /*
  * Copyright (c) 2014 Reyk Floeter <reyk@openbsd.org>
