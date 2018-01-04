@@ -733,16 +733,21 @@ relay_connected(int fd, short sig, void *arg)
 	if ((rlay->rl_conf.flags & F_TLSCLIENT) && (out->tls != NULL))
 		relay_tls_connected(out);
 
-	bufferevent_settimeout(bev,
-	    rlay->rl_conf.timeout.tv_sec, rlay->rl_conf.timeout.tv_sec);
 	bufferevent_setwatermark(bev, EV_WRITE,
 		RELAY_MIN_PREFETCHED * proto->tcpbufsiz, 0);
 	bufferevent_enable(bev, EV_READ|EV_WRITE);
 	if (con->se_in.bev)
 		bufferevent_enable(con->se_in.bev, EV_READ);
 
-	if (relay_splice(&con->se_out) == -1)
+	switch (relay_splice(&con->se_out)) {
+	case 0:
+		bufferevent_settimeout(bev,
+		    rlay->rl_conf.timeout.tv_sec, rlay->rl_conf.timeout.tv_sec);
+		break;
+	case -1:
 		relay_close(con, strerror(errno));
+		break;
+	}
 }
 
 void
@@ -784,14 +789,19 @@ relay_input(struct rsession *con)
 	if ((rlay->rl_conf.flags & F_TLS) && con->se_in.tls != NULL)
 		relay_tls_connected(&con->se_in);
 
-	bufferevent_settimeout(con->se_in.bev,
-	    rlay->rl_conf.timeout.tv_sec, rlay->rl_conf.timeout.tv_sec);
 	bufferevent_setwatermark(con->se_in.bev, EV_WRITE,
 		RELAY_MIN_PREFETCHED * proto->tcpbufsiz, 0);
 	bufferevent_enable(con->se_in.bev, EV_READ|EV_WRITE);
 
-	if (relay_splice(&con->se_in) == -1)
+	switch (relay_splice(&con->se_in)) {
+	case 0:
+		bufferevent_settimeout(con->se_in.bev,
+		    rlay->rl_conf.timeout.tv_sec, rlay->rl_conf.timeout.tv_sec);
+		break;
+	case -1:
 		relay_close(con, strerror(errno));
+		break;
+	}
 }
 
 void
