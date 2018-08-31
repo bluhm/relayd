@@ -213,7 +213,7 @@ main(int argc, char *argv[])
 		ps->ps_title[proc_id] = title;
 
 	/* only the parent returns */
-	proc_init(ps, procs, nitems(procs), argc0, argv, proc_id);
+	proc_init(ps, procs, nitems(procs), debug, argc0, argv, proc_id);
 
 	log_procinit("parent");
 	if (!debug && daemon(1, 0) == -1)
