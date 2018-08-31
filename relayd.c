@@ -184,6 +184,7 @@ main(int argc, char *argv[])
 	TAILQ_INIT(&env->sc_hosts);
 	TAILQ_INIT(&env->sc_sessions);
 	env->sc_rtable = getrtable();
+	env->sc_snmp = -1;
 	/* initialize the TLS session id to a random key for all relay procs */
 	arc4random_buf(env->sc_conf.tls_sid, sizeof(env->sc_conf.tls_sid));
 
