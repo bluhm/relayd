@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.228 2018/09/07 07:35:31 miko Exp $	*/
+/*	$OpenBSD: parse.y,v 1.233 2019/03/13 23:29:32 benno Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -123,8 +123,7 @@ static enum direction	 dir = RELAY_DIR_ANY;
 static char		*rulefile = NULL;
 static union hashkey	*hashkey = NULL;
 
-struct address	*host_v4(const char *);
-struct address	*host_v6(const char *);
+struct address	*host_ip(const char *);
 int		 host_dns(const char *, struct addresslist *,
 		    int, struct portrange *, const char *, int);
 int		 host_if(const char *, struct addresslist *,
@@ -174,9 +173,10 @@ typedef struct {
 %token	PREFORK PRIORITY PROTO QUERYSTR REAL REDIRECT RELAY REMOVE REQUEST
 %token	RESPONSE RETRY QUICK RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION
 %token	SNMP SOCKET SPLICE SSL STICKYADDR STYLE TABLE TAG TAGGED TCP TIMEOUT TLS
-%token	TO ROUTER RTLABEL TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE
+%token	TO ROUTER RTLABEL TRANSPARENT TRAP UPDATES URL WITH TTL RTABLE
 %token	MATCH PARAMS RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDHE
 %token	EDH TICKETS CONNECTION CONNECTIONS ERRORS STATE CHANGES CHECKS
+%token	WEBSOCKETS
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table value optstring
@@ -1065,8 +1065,20 @@ protoptsl	: ssltls tlsflags
 		| ssltls '{' tlsflags_l '}'
 		| TCP tcpflags
 		| TCP '{' tcpflags_l '}'
-		| HTTP httpflags
-		| HTTP '{' httpflags_l '}'
+		| HTTP {
+			if (proto->type != RELAY_PROTO_HTTP) {
+				yyerror("can set http options only for "
+				    "http protocol");
+				YYERROR;
+			}
+		} httpflags
+		| HTTP  {
+			if (proto->type != RELAY_PROTO_HTTP) {
+				yyerror("can set http options only for "
+				    "http protocol");
+				YYERROR;
+			}
+		} '{' httpflags_l '}'
 		| RETURN ERROR opteflags	{ proto->flags |= F_RETURN; }
 		| RETURN ERROR '{' eflags_l '}'	{ proto->flags |= F_RETURN; }
 		| filterrule
@@ -1079,17 +1091,14 @@ httpflags_l	: httpflags comma httpflags_l
 		;
 
 httpflags	: HEADERLEN NUMBER	{
-			if (proto->type != RELAY_PROTO_HTTP) {
-				yyerror("can set http options only for "
-				    "http protocol");
-				YYERROR;
-			}
 			if ($2 < 0 || $2 > RELAY_MAXHEADERLENGTH) {
 				yyerror("invalid headerlen: %d", $2);
 				YYERROR;
 			}
 			proto->httpheaderlen = $2;
 		}
+		| WEBSOCKETS	{ proto->httpflags |= HTTPFLAG_WEBSOCKETS; }
+		| NO WEBSOCKETS	{ proto->httpflags &= ~HTTPFLAG_WEBSOCKETS; }
 		;
 
 tcpflags_l	: tcpflags comma tcpflags_l
@@ -2338,7 +2347,7 @@ lookup(char *s)
 		{ "updates",		UPDATES },
 		{ "url",		URL },
 		{ "value",		VALUE },
-		{ "virtual",		VIRTUAL },
+		{ "websockets",		WEBSOCKETS },
 		{ "with",		WITH }
 	};
 	const struct keywords	*p;
@@ -2519,7 +2528,8 @@ top:
 			} else if (c == '\\') {
 				if ((next = lgetc(quotec)) == EOF)
 					return (0);
-				if (next == quotec || c == ' ' || c == '\t')
+				if (next == quotec || next == ' ' ||
+				    next == '\t')
 					c = next;
 				else if (next == '\n') {
 					file->lineno++;
@@ -2551,7 +2561,7 @@ top:
 	if (c == '-' || isdigit(c)) {
 		do {
 			*p++ = c;
-			if ((unsigned)(p-buf) >= sizeof(buf)) {
+			if ((size_t)(p-buf) >= sizeof(buf)) {
 				yyerror("string too long");
 				return (findeol());
 			}
@@ -2590,7 +2600,7 @@ nodigits:
 	if (isalnum(c) || c == ':' || c == '_') {
 		do {
 			*p++ = c;
-			if ((unsigned)(p-buf) >= sizeof(buf)) {
+			if ((size_t)(p-buf) >= sizeof(buf)) {
 				yyerror("string too long");
 				return (findeol());
 			}
@@ -2929,49 +2939,22 @@ symget(const char *nam)
 }
 
 struct address *
-host_v4(const char *s)
+host_ip(const char *s)
 {
-	struct in_addr		 ina;
-	struct sockaddr_in	*sain;
-	struct address		*h;
+	struct addrinfo	 hints, *res;
+	struct address	*h = NULL;
 
-	bzero(&ina, sizeof(ina));
-	if (inet_pton(AF_INET, s, &ina) != 1)
-		return (NULL);
-
-	if ((h = calloc(1, sizeof(*h))) == NULL)
-		fatal(__func__);
-	sain = (struct sockaddr_in *)&h->ss;
-	sain->sin_len = sizeof(struct sockaddr_in);
-	sain->sin_family = AF_INET;
-	sain->sin_addr.s_addr = ina.s_addr;
-
-	return (h);
-}
-
-struct address *
-host_v6(const char *s)
-{
-	struct addrinfo		 hints, *res;
-	struct sockaddr_in6	*sa_in6;
-	struct address		*h = NULL;
-
-	bzero(&hints, sizeof(hints));
-	hints.ai_family = AF_INET6;
-	hints.ai_socktype = SOCK_DGRAM; /* dummy */
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM; /*dummy*/
 	hints.ai_flags = AI_NUMERICHOST;
 	if (getaddrinfo(s, "0", &hints, &res) == 0) {
-		if ((h = calloc(1, sizeof(*h))) == NULL)
-			fatal(__func__);
-		sa_in6 = (struct sockaddr_in6 *)&h->ss;
-		sa_in6->sin6_len = sizeof(struct sockaddr_in6);
-		sa_in6->sin6_family = AF_INET6;
-		memcpy(&sa_in6->sin6_addr,
-		    &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr,
-		    sizeof(sa_in6->sin6_addr));
-		sa_in6->sin6_scope_id =
-		    ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
-
+		if (res->ai_family == AF_INET ||
+		    res->ai_family == AF_INET6) {
+			if ((h = calloc(1, sizeof(*h))) == NULL)
+				fatal(NULL);
+			memcpy(&h->ss, res->ai_addr, res->ai_addrlen);
+		}
 		freeaddrinfo(res);
 	}
 
@@ -2984,15 +2967,13 @@ host_dns(const char *s, struct addresslist *al, int max,
 {
 	struct addrinfo		 hints, *res0, *res;
 	int			 error, cnt = 0;
-	struct sockaddr_in	*sain;
-	struct sockaddr_in6	*sin6;
 	struct address		*h;
 
 	if ((cnt = host_if(s, al, max, port, ifname, ipproto)) != 0)
 		return (cnt);
 
 	bzero(&hints, sizeof(hints));
-	hints.ai_family = PF_UNSPEC;
+	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM; /* DUMMY */
 	hints.ai_flags = AI_ADDRCONFIG;
 	error = getaddrinfo(s, NULL, &hints, &res0);
@@ -3024,19 +3005,8 @@ host_dns(const char *s, struct addresslist *al, int max,
 		}
 		if (ipproto != -1)
 			h->ipproto = ipproto;
-		h->ss.ss_family = res->ai_family;
 
-		if (res->ai_family == AF_INET) {
-			sain = (struct sockaddr_in *)&h->ss;
-			sain->sin_len = sizeof(struct sockaddr_in);
-			sain->sin_addr.s_addr = ((struct sockaddr_in *)
-			    res->ai_addr)->sin_addr.s_addr;
-		} else {
-			sin6 = (struct sockaddr_in6 *)&h->ss;
-			sin6->sin6_len = sizeof(struct sockaddr_in6);
-			memcpy(&sin6->sin6_addr, &((struct sockaddr_in6 *)
-			    res->ai_addr)->sin6_addr, sizeof(struct in6_addr));
-		}
+		memcpy(&h->ss, res->ai_addr, res->ai_addrlen);
 
 		TAILQ_INSERT_HEAD(al, h, entry);
 		cnt++;
@@ -3123,34 +3093,27 @@ int
 host(const char *s, struct addresslist *al, int max,
     struct portrange *port, const char *ifname, int ipproto)
 {
-	struct address *h;
+	struct address	*h;
 
-	h = host_v4(s);
+	if ((h = host_ip(s)) == NULL)
+		return (host_dns(s, al, max, port, ifname, ipproto));
 
-	/* IPv6 address? */
-	if (h == NULL)
-		h = host_v6(s);
-
-	if (h != NULL) {
-		if (port != NULL)
-			bcopy(port, &h->port, sizeof(h->port));
-		if (ifname != NULL) {
-			if (strlcpy(h->ifname, ifname, sizeof(h->ifname)) >=
-			    sizeof(h->ifname)) {
-				log_warnx("%s: interface name truncated",
-				    __func__);
-				free(h);
-				return (-1);
-			}
+	if (port != NULL)
+		bcopy(port, &h->port, sizeof(h->port));
+	if (ifname != NULL) {
+		if (strlcpy(h->ifname, ifname, sizeof(h->ifname)) >=
+		    sizeof(h->ifname)) {
+			log_warnx("%s: interface name truncated",
+			    __func__);
+			free(h);
+			return (-1);
 		}
-		if (ipproto != -1)
-			h->ipproto = ipproto;
-
-		TAILQ_INSERT_HEAD(al, h, entry);
-		return (1);
 	}
+	if (ipproto != -1)
+		h->ipproto = ipproto;
 
-	return (host_dns(s, al, max, port, ifname, ipproto));
+	TAILQ_INSERT_HEAD(al, h, entry);
+	return (1);
 }
 
 void

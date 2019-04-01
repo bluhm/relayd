@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.240 2018/08/06 17:31:31 benno Exp $	*/
+/*	$OpenBSD: relay.c,v 1.242 2019/03/04 21:25:03 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -1410,7 +1410,13 @@ relay_session(struct rsession *con)
 		return;
 	}
 
-	if (rlay->rl_proto->type != RELAY_PROTO_HTTP) {
+	if (rlay->rl_proto->type == RELAY_PROTO_HTTP) {
+		if (relay_http_priv_init(con) == -1) {
+			relay_close(con,
+			    "failed to allocate http session data", 1);
+			return;
+		}
+	} else {
 		if (rlay->rl_conf.fwdmode == FWD_TRANS)
 			relay_bindanyreq(con, 0, IPPROTO_TCP);
 		else if (relay_connect(con) == -1) {
@@ -1910,6 +1916,14 @@ relay_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 int
 relay_dispatch_ca(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
+	switch (imsg->hdr.type) {
+	case IMSG_CA_PRIVENC:
+	case IMSG_CA_PRIVDEC:
+		log_warnx("%s: priv%s result after timeout", __func__,
+		    imsg->hdr.type == IMSG_CA_PRIVENC ? "enc" : "dec");
+		return (0);
+	}
+
 	return (-1);
 }
 
