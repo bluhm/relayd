@@ -1,4 +1,4 @@
-/*	$OpenBSD: proc.c,v 1.40 2018/09/09 21:06:51 bluhm Exp $	*/
+/*	$OpenBSD: proc.c,v 1.52 2024/11/21 13:38:45 claudio Exp $	*/
 
 /*
  * Copyright (c) 2010 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -37,29 +37,16 @@
 #include "relayd.h"
 
 void	 proc_exec(struct privsep *, struct privsep_proc *, unsigned int, int,
-	    int, char **);
+	    char **);
 void	 proc_setup(struct privsep *, struct privsep_proc *, unsigned int);
 void	 proc_open(struct privsep *, int, int);
 void	 proc_accept(struct privsep *, int, enum privsep_procid,
 	    unsigned int);
 void	 proc_close(struct privsep *);
-int	 proc_ispeer(struct privsep_proc *, unsigned int, enum privsep_procid);
 void	 proc_shutdown(struct privsep_proc *);
 void	 proc_sig_handler(int, short, void *);
 void	 proc_range(struct privsep *, enum privsep_procid, int *, int *);
 int	 proc_dispatch_null(int, struct privsep_proc *, struct imsg *);
-
-int
-proc_ispeer(struct privsep_proc *procs, unsigned int nproc,
-    enum privsep_procid type)
-{
-	unsigned int	i;
-
-	for (i = 0; i < nproc; i++)
-		if (procs[i].p_id == type)
-			return (1);
-	return (0);
-}
 
 enum privsep_procid
 proc_getid(struct privsep_proc *procs, unsigned int nproc,
@@ -81,7 +68,7 @@ proc_getid(struct privsep_proc *procs, unsigned int nproc,
 
 void
 proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
-    int debug, int argc, char **argv)
+    int argc, char **argv)
 {
 	unsigned int		 proc, nargc, i, proc_i;
 	char			**nargv;
@@ -130,10 +117,6 @@ proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 				fatal("%s: fork", __func__);
 				break;
 			case 0:
-				/* First create a new session */
-				if (setsid() == -1)
-					fatal("setsid");
-
 				/* Prepare parent socket. */
 				if (fd != PROC_PARENT_SOCK_FILENO) {
 					if (dup2(fd, PROC_PARENT_SOCK_FILENO)
@@ -141,16 +124,6 @@ proc_exec(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 						fatal("dup2");
 				} else if (fcntl(fd, F_SETFD, 0) == -1)
 					fatal("fcntl");
-
-				/* Daemons detach from terminal. */
-				if (!debug && (fd =
-				    open(_PATH_DEVNULL, O_RDWR, 0)) != -1) {
-					(void)dup2(fd, STDIN_FILENO);
-					(void)dup2(fd, STDOUT_FILENO);
-					(void)dup2(fd, STDERR_FILENO);
-					if (fd > 2)
-						(void)close(fd);
-				}
 
 				execvp(argv[0], nargv);
 				fatal("%s: execvp", __func__);
@@ -182,7 +155,10 @@ proc_connect(struct privsep *ps)
 
 		for (inst = 0; inst < ps->ps_instances[dst]; inst++) {
 			iev = &ps->ps_ievs[dst][inst];
-			imsg_init(&iev->ibuf, ps->ps_pp->pp_pipes[dst][inst]);
+			if (imsgbuf_init(&iev->ibuf,
+			    ps->ps_pp->pp_pipes[dst][inst]) == -1)
+				fatal("imsgbuf_init");
+			imsgbuf_allow_fdpass(&iev->ibuf);
 			event_set(&iev->ev, iev->ibuf.fd, iev->events,
 			    iev->handler, iev->data);
 			event_add(&iev->ev, NULL);
@@ -218,6 +194,9 @@ proc_init(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 		privsep_process = PROC_PARENT;
 		proc_setup(ps, procs, nproc);
 
+		if (!debug && daemon(1, 0) == -1)
+			fatal("failed to daemonize");
+
 		/*
 		 * Create the children sockets so we can use them
 		 * to distribute the rest of the socketpair()s using
@@ -242,7 +221,7 @@ proc_init(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc,
 		}
 
 		/* Engage! */
-		proc_exec(ps, procs, nproc, debug, argc, argv);
+		proc_exec(ps, procs, nproc, argc, argv);
 		return;
 	}
 
@@ -288,7 +267,9 @@ proc_accept(struct privsep *ps, int fd, enum privsep_procid dst,
 		pp->pp_pipes[dst][n] = fd;
 
 	iev = &ps->ps_ievs[dst][n];
-	imsg_init(&iev->ibuf, fd);
+	if (imsgbuf_init(&iev->ibuf, fd) == -1)
+		fatal("imsgbuf_init");
+	imsgbuf_allow_fdpass(&iev->ibuf);
 	event_set(&iev->ev, iev->ibuf.fd, iev->events, iev->handler, iev->data);
 	event_add(&iev->ev, NULL);
 }
@@ -318,7 +299,7 @@ proc_setup(struct privsep *ps, struct privsep_proc *procs, unsigned int nproc)
 		    sizeof(struct imsgev))) == NULL)
 			fatal("%s: calloc", __func__);
 
-		/* With this set up, we are ready to call imsg_init(). */
+		/* With this set up, we are ready to call imsgbuf_init(). */
 		for (i = 0; i < ps->ps_instances[id]; i++) {
 			ps->ps_ievs[id][i].handler = proc_dispatch;
 			ps->ps_ievs[id][i].events = EV_READ;
@@ -419,6 +400,11 @@ proc_open(struct privsep *ps, int src, int dst)
 			if (src == dst && i == j)
 				continue;
 
+			/* No need for CA to CA or RELAY to RELAY sockets. */
+			if ((src == PROC_CA && dst == PROC_CA) ||
+			    (src == PROC_RELAY && dst == PROC_RELAY))
+				continue;
+
 			pa = &ps->ps_pipes[src][i];
 			pb = &ps->ps_pipes[dst][j];
 			if (socketpair(AF_UNIX,
@@ -447,7 +433,7 @@ proc_open(struct privsep *ps, int src, int dst)
 			 */
 			if (proc_flush_imsg(ps, src, i) == -1 ||
 			    proc_flush_imsg(ps, dst, j) == -1)
-				fatal("%s: imsg_flush", __func__);
+				fatal("%s: proc_flush_imsg", __func__);
 		}
 	}
 }
@@ -473,7 +459,7 @@ proc_close(struct privsep *ps)
 
 			/* Cancel the fd, close and invalidate the fd */
 			event_del(&(ps->ps_ievs[dst][n].ev));
-			imsg_clear(&(ps->ps_ievs[dst][n].ibuf));
+			imsgbuf_clear(&(ps->ps_ievs[dst][n].ibuf));
 			close(pp->pp_pipes[dst][n]);
 			pp->pp_pipes[dst][n] = -1;
 		}
@@ -532,9 +518,6 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 
 	log_procinit(p->p_title);
 
-	/* Set the process group of the current process */
-	setpgid(0, 0);
-
 	if (p->p_id == PROC_CONTROL && ps->ps_instance == 0) {
 		if (control_init(ps, &ps->ps_csock) == -1)
 			fatalx("%s: control_init", __func__);
@@ -588,7 +571,6 @@ proc_run(struct privsep *ps, struct privsep_proc *p,
 	proc_setup(ps, procs, nproc);
 	proc_accept(ps, PROC_PARENT_SOCK_FILENO, PROC_PARENT, 0);
 	if (p->p_id == PROC_CONTROL && ps->ps_instance == 0) {
-		TAILQ_INIT(&ctl_conns);
 		if (control_listen(&ps->ps_csock) == -1)
 			fatalx("%s: control_listen", __func__);
 		TAILQ_FOREACH(rcs, &ps->ps_rcsocks, cs_entry)
@@ -624,8 +606,8 @@ proc_dispatch(int fd, short event, void *arg)
 	ibuf = &iev->ibuf;
 
 	if (event & EV_READ) {
-		if ((n = imsg_read(ibuf)) == -1 && errno != EAGAIN)
-			fatal("%s: imsg_read", __func__);
+		if ((n = imsgbuf_read(ibuf)) == -1)
+			fatal("%s: imsgbuf_read", __func__);
 		if (n == 0) {
 			/* this pipe is dead, so remove the event handler */
 			event_del(&iev->ev);
@@ -635,13 +617,14 @@ proc_dispatch(int fd, short event, void *arg)
 	}
 
 	if (event & EV_WRITE) {
-		if ((n = msgbuf_write(&ibuf->w)) == -1 && errno != EAGAIN)
-			fatal("%s: msgbuf_write", __func__);
-		if (n == 0) {
-			/* this pipe is dead, so remove the event handler */
-			event_del(&iev->ev);
-			event_loopexit(NULL);
-			return;
+		if (imsgbuf_write(ibuf) == -1) {
+			if (errno == EPIPE) {
+				/* this pipe is dead, remove the handler */
+				event_del(&iev->ev);
+				event_loopexit(NULL);
+				return;
+			}
+			fatal("%s: imsgbuf_write", __func__);
 		}
 	}
 
@@ -678,7 +661,7 @@ proc_dispatch(int fd, short event, void *arg)
 		case IMSG_CTL_PROCFD:
 			IMSG_SIZE_CHECK(&imsg, &pf);
 			memcpy(&pf, imsg.data, sizeof(pf));
-			proc_accept(ps, imsg.fd, pf.pf_procid,
+			proc_accept(ps, imsg_get_fd(&imsg), pf.pf_procid,
 			    pf.pf_instance);
 			break;
 		default:
@@ -707,12 +690,12 @@ void
 imsg_event_add(struct imsgev *iev)
 {
 	if (iev->handler == NULL) {
-		imsg_flush(&iev->ibuf);
+		imsgbuf_flush(&iev->ibuf);
 		return;
 	}
 
 	iev->events = EV_READ;
-	if (iev->ibuf.w.queued)
+	if (imsgbuf_queuelen(&iev->ibuf) > 0)
 		iev->events |= EV_WRITE;
 
 	event_del(&iev->ev);
@@ -809,7 +792,7 @@ proc_forward_imsg(struct privsep *ps, struct imsg *imsg,
     enum privsep_procid id, int n)
 {
 	return (proc_compose_imsg(ps, id, n, imsg->hdr.type,
-	    imsg->hdr.peerid, imsg->fd, imsg->data, IMSG_DATA_SIZE(imsg)));
+	    imsg->hdr.peerid, -1, imsg->data, IMSG_DATA_SIZE(imsg)));
 }
 
 struct imsgbuf *
@@ -841,10 +824,7 @@ proc_flush_imsg(struct privsep *ps, enum privsep_procid id, int n)
 	for (; n < m; n++) {
 		if ((ibuf = proc_ibuf(ps, id, n)) == NULL)
 			return (-1);
-		do {
-			ret = imsg_flush(ibuf);
-		} while (ret == -1 && errno == EAGAIN);
-		if (ret == -1)
+		if ((ret = imsgbuf_flush(ibuf)) == -1)
 			break;
 		imsg_event_add(&ps->ps_ievs[id][n]);
 	}

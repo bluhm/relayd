@@ -1,4 +1,4 @@
-/*	$OpenBSD: http.h,v 1.10 2019/03/04 21:25:03 benno Exp $	*/
+/*	$OpenBSD: http.h,v 1.12 2021/03/24 20:59:53 benno Exp $	*/
 
 /*
  * Copyright (c) 2012 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -18,6 +18,8 @@
 
 #ifndef HTTP_H
 #define HTTP_H
+
+#include <sys/queue.h>
 
 #define HTTP_PORT	80
 #define HTTPS_PORT	443
@@ -251,10 +253,13 @@ struct http_descriptor {
 	struct kvtree		 http_headers;
 };
 
-struct relay_http_priv {
-#define HTTP_CONNECTION_UPGRADE	0x01
-#define HTTP_UPGRADE_WEBSOCKET	0x02
-	int			 http_upgrade_req;
+struct http_method_node {
+	enum httpmethod			hmn_method;
+	SIMPLEQ_ENTRY(http_method_node)	hmn_entry;
+};
+
+struct http_session {
+	SIMPLEQ_HEAD(, http_method_node) hs_methods;
 };
 
 #endif /* HTTP_H */

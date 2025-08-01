@@ -1,4 +1,4 @@
-/*	$OpenBSD: hce.c,v 1.79 2018/08/06 17:31:31 benno Exp $	*/
+/*	$OpenBSD: hce.c,v 1.82 2024/05/18 06:34:46 jsg Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -30,7 +30,6 @@
 #include "relayd.h"
 
 void	 hce_init(struct privsep *, struct privsep_proc *p, void *);
-void	 hce_sig_handler(int sig, short, void *);
 void	 hce_launch_checks(int, short, void *);
 void	 hce_setup_events(void);
 void	 hce_disable_events(void);
@@ -92,6 +91,8 @@ hce_setup_events(void)
 			    table->tls_cfg != NULL)
 				continue;
 			table->tls_cfg = tls_config_new();
+			if (table->tls_cfg == NULL)
+				fatalx("%s: tls_config_new", __func__);
 			tls_config_insecure_noverifycert(table->tls_cfg);
 			tls_config_insecure_noverifyname(table->tls_cfg);
 		}
@@ -139,7 +140,6 @@ hce_launch_checks(int fd, short event, void *arg)
 		TAILQ_FOREACH(host, &table->hosts, entry) {
 			if ((host->flags & F_CHECK_DONE) == 0)
 				host->he = HCE_INTERVAL_TIMEOUT;
-			host->flags &= ~(F_CHECK_SENT|F_CHECK_DONE);
 			if (event_initialized(&host->cte.ev)) {
 				event_del(&host->cte.ev);
 				close(host->cte.s);

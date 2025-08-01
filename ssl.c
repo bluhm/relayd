@@ -1,4 +1,4 @@
-/*	$OpenBSD: ssl.c,v 1.34 2017/07/28 13:58:52 bluhm Exp $	*/
+/*	$OpenBSD: ssl.c,v 1.37 2023/06/25 08:07:39 op Exp $	*/
 
 /*
  * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -27,30 +27,10 @@
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include <openssl/engine.h>
 
 #include "relayd.h"
-#include "boguskeys.h"
 
 int	ssl_password_cb(char *, int, int, void *);
-
-void
-ssl_init(struct relayd *env)
-{
-	static int	 initialized = 0;
-
-	if (initialized)
-		return;
-
-	SSL_library_init();
-	SSL_load_error_strings();
-
-	/* Init hardware crypto engines. */
-	ENGINE_load_builtin_engines();
-	ENGINE_register_all_complete();
-
-	initialized = 1;
-}
 
 int
 ssl_password_cb(char *buf, int size, int rwflag, void *u)
@@ -73,9 +53,6 @@ ssl_load_key(struct relayd *env, const char *name, off_t *len, char *pass)
 	BIO		*bio = NULL;
 	long		 size;
 	char		*data, *buf = NULL;
-
-	/* Initialize SSL library once */
-	ssl_init(env);
 
 	/*
 	 * Read (possibly) encrypted key from file
@@ -124,16 +101,9 @@ ssl_update_certificate(const uint8_t *oldcert, size_t oldlen, EVP_PKEY *pkey,
 	BIO		*in, *out = NULL;
 	BUF_MEM		*bptr = NULL;
 	X509		*cert = NULL;
-	uint8_t		*newcert = NULL, *foo = NULL;
+	uint8_t		*newcert = NULL;
 
-	/* XXX BIO_new_mem_buf is not using const so work around this */
-	if ((foo = malloc(oldlen)) == NULL) {
-		log_warn("%s: malloc", __func__);
-		return (NULL);
-	}
-	memcpy(foo, oldcert, oldlen);
-
-	if ((in = BIO_new_mem_buf(foo, oldlen)) == NULL) {
+	if ((in = BIO_new_mem_buf(oldcert, oldlen)) == NULL) {
 		log_warnx("%s: BIO_new_mem_buf failed", __func__);
 		goto done;
 	}
@@ -194,7 +164,6 @@ ssl_update_certificate(const uint8_t *oldcert, size_t oldlen, EVP_PKEY *pkey,
 	*newlen = bptr->length;
 
 done:
-	free(foo);
 	if (in)
 		BIO_free(in);
 	if (out)
@@ -261,65 +230,4 @@ ssl_load_pkey(char *buf, off_t len, X509 **x509ptr, EVP_PKEY **pkeyptr)
 	BIO_free(in);
 
 	return (0);
-}
-
-/*
- * This function is a horrible hack but for RSA privsep to work a private key
- * with correct size needs to be loaded into the tls config.
- */
-int
-ssl_ctx_fake_private_key(char *buf, off_t len, const char **fake_key)
-{
-	BIO		*in;
-	EVP_PKEY	*pkey = NULL;
-	X509		*x509 = NULL;
-	int		 ret = -1, keylen;
-
-	if ((in = BIO_new_mem_buf(buf, len)) == NULL) {
-		log_warnx("%s: BIO_new_mem_buf failed", __func__);
-		return (0);
-	}
-
-	if ((x509 = PEM_read_bio_X509(in, NULL, NULL, NULL)) == NULL) {
-		log_warnx("%s: PEM_read_bio_X509 failed", __func__);
-		goto fail;
-	}
-
-	if ((pkey = X509_get_pubkey(x509)) == NULL) {
-		log_warnx("%s: X509_get_pubkey failed", __func__);
-		goto fail;
-	}
-
-	keylen = EVP_PKEY_size(pkey) * 8;
-	switch(keylen) {
-	case 1024:
-		*fake_key = bogus_1024;
-		ret = sizeof(bogus_1024);
-		break;
-	case 2048:
-		*fake_key = bogus_2048;
-		ret = sizeof(bogus_2048);
-		break;
-	case 4096:
-		*fake_key = bogus_4096;
-		ret = sizeof(bogus_4096);
-		break;
-	case 8192:
-		*fake_key = bogus_8192;
-		ret = sizeof(bogus_8192);
-		break;
-	default:
-		log_warnx("%s: key size %d not support", __func__, keylen);
-		ret = -1;
-		break;
-	}
-fail:
-	BIO_free(in);
-
-	if (pkey != NULL)
-		EVP_PKEY_free(pkey);
-	if (x509 != NULL)
-		X509_free(x509);
-
-	return (ret);
 }

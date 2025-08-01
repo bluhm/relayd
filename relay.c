@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay.c,v 1.242 2019/03/04 21:25:03 benno Exp $	*/
+/*	$OpenBSD: relay.c,v 1.260 2024/10/28 19:56:18 tb Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
@@ -19,7 +19,6 @@
 #include <sys/types.h>
 #include <sys/queue.h>
 #include <sys/time.h>
-#include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/tree.h>
 
@@ -28,6 +27,7 @@
 #include <arpa/inet.h>
 
 #include <limits.h>
+#include <netdb.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,10 +76,13 @@ int		 relay_tls_ctx_create(struct relay *);
 void		 relay_tls_transaction(struct rsession *,
 		    struct ctl_relay_event *);
 void		 relay_tls_handshake(int, short, void *);
-void		 relay_connect_retry(int, short, void *);
 void		 relay_tls_connected(struct ctl_relay_event *);
 void		 relay_tls_readcb(int, short, void *);
 void		 relay_tls_writecb(int, short, void *);
+
+void		 relay_connect_retry(int, short, void *);
+void		 relay_connect_state(struct rsession *,
+		    struct ctl_relay_event *, enum relay_state);
 
 extern void	 bufferevent_read_pressure_cb(struct evbuffer *, size_t,
 		    size_t, void *);
@@ -117,6 +120,7 @@ relay_ruledebug(struct relay_rule *rule)
 {
 	struct kv	*kv = NULL;
 	u_int		 i;
+	char		 buf[NI_MAXHOST];
 
 	fprintf(stderr, "\t\t");
 
@@ -149,6 +153,25 @@ relay_ruledebug(struct relay_rule *rule)
 
 	if (rule->rule_flags & RULE_FLAG_QUICK)
 		fprintf(stderr, "quick ");
+
+	switch (rule->rule_af) {
+	case AF_INET:
+		fprintf(stderr, "inet ");
+		break;
+	case AF_INET6:
+		fprintf(stderr, "inet6 ");
+		break;
+	}
+
+	if (rule->rule_src.addr.ss_family != AF_UNSPEC)
+		fprintf(stderr, "from %s/%d ",
+		    print_host(&rule->rule_src.addr, buf, sizeof(buf)),
+		    rule->rule_src.addr_mask);
+
+	if (rule->rule_dst.addr.ss_family != AF_UNSPEC)
+		fprintf(stderr, "to %s/%d ",
+		    print_host(&rule->rule_dst.addr, buf, sizeof(buf)),
+		    rule->rule_dst.addr_mask);
 
 	for (i = 1; i < KEY_TYPE_MAX; i++) {
 		kv = &rule->rule_kv[i];
@@ -191,6 +214,9 @@ relay_ruledebug(struct relay_rule *rule)
 		case KEY_OPTION_LOG:
 			fprintf(stderr, "log ");
 			break;
+		case KEY_OPTION_STRIP:
+			fprintf(stderr, "strip ");
+			break;
 		case KEY_OPTION_NONE:
 			break;
 		}
@@ -204,13 +230,15 @@ relay_ruledebug(struct relay_rule *rule)
 			break;
 		}
 
+		int kvv = (kv->kv_option == KEY_OPTION_STRIP ||
+		     kv->kv_value == NULL);
 		fprintf(stderr, "%s%s%s%s%s%s ",
 		    kv->kv_key == NULL ? "" : "\"",
 		    kv->kv_key == NULL ? "" : kv->kv_key,
 		    kv->kv_key == NULL ? "" : "\"",
-		    kv->kv_value == NULL ? "" : " value \"",
+		    kvv ? "" : " value \"",
 		    kv->kv_value == NULL ? "" : kv->kv_value,
-		    kv->kv_value == NULL ? "" : "\"");
+		    kvv ? "" : "\"");
 	}
 
 	if (rule->rule_tablename[0])
@@ -654,6 +682,7 @@ relay_socket_listen(struct sockaddr_storage *ss, in_port_t port,
 void
 relay_connected(int fd, short sig, void *arg)
 {
+	char			 obuf[128];
 	struct rsession		*con = arg;
 	struct relay		*rlay = con->se_relay;
 	struct protocol		*proto = rlay->rl_proto;
@@ -695,6 +724,22 @@ relay_connected(int fd, short sig, void *arg)
 	}
 
 	DPRINTF("%s: session %d: successful", __func__, con->se_id);
+
+	/* Log destination if it was changed in a keep-alive connection */
+	if ((con->se_table != con->se_table0) &&
+	    (env->sc_conf.opts & (RELAYD_OPT_LOGCON|RELAYD_OPT_LOGCONERR))) {
+		con->se_table0 = con->se_table;
+		memset(&obuf, 0, sizeof(obuf));
+		(void)print_host(&con->se_out.ss, obuf, sizeof(obuf));
+		if (asprintf(&msg, " -> %s:%d",
+		    obuf, ntohs(con->se_out.port)) == -1) {
+			relay_abort_http(con, 500,
+			    "connection changed and asprintf failed", 0);
+			return;
+		}
+		relay_log(con, msg);
+		free(msg);
+	}
 
 	switch (rlay->rl_proto->type) {
 	case RELAY_PROTO_HTTP:
@@ -755,7 +800,7 @@ relay_input(struct rsession *con)
 
 	switch (rlay->rl_proto->type) {
 	case RELAY_PROTO_HTTP:
-		if (relay_httpdesc_init(&con->se_in) == -1) {
+		if (relay_http_priv_init(con) == -1) {
 			relay_close(con,
 			    "failed to allocate http descriptor", 1);
 			return;
@@ -1118,7 +1163,13 @@ relay_accept(int fd, short event, void *arg)
 		con->se_in.port = ((struct sockaddr_in6 *)&ss)->sin6_port;
 		break;
 	}
-	bcopy(&ss, &con->se_in.ss, sizeof(con->se_in.ss));
+	memcpy(&con->se_in.ss, &ss, sizeof(con->se_in.ss));
+
+	slen = sizeof(con->se_sockname);
+	if (getsockname(s, (struct sockaddr *)&con->se_sockname, &slen) == -1) {
+		relay_close(con, "sockname lookup failed", 1);
+		return;
+	}
 
 	getmonotime(&con->se_tv_start);
 	bcopy(&con->se_tv_start, &con->se_tv_last, sizeof(con->se_tv_last));
@@ -1143,12 +1194,8 @@ relay_accept(int fd, short event, void *arg)
 	}
 
 	if (rlay->rl_conf.flags & F_DIVERT) {
-		slen = sizeof(con->se_out.ss);
-		if (getsockname(s, (struct sockaddr *)&con->se_out.ss,
-		    &slen) == -1) {
-			relay_close(con, "peer lookup failed", 1);
-			return;
-		}
+		memcpy(&con->se_out.ss, &con->se_sockname,
+		    sizeof(con->se_out.ss));
 		con->se_out.port = relay_socket_getport(&con->se_out.ss);
 
 		/* Detect loop and fall back to the alternate forward target */
@@ -1169,13 +1216,8 @@ relay_accept(int fd, short event, void *arg)
 		cnl->proc = ps->ps_instance;
 		cnl->proto = IPPROTO_TCP;
 
-		bcopy(&con->se_in.ss, &cnl->src, sizeof(cnl->src));
-		slen = sizeof(cnl->dst);
-		if (getsockname(s,
-		    (struct sockaddr *)&cnl->dst, &slen) == -1) {
-			relay_close(con, "failed to get local address", 1);
-			return;
-		}
+		memcpy(&cnl->src, &con->se_in.ss, sizeof(cnl->src));
+		memcpy(&cnl->dst, &con->se_sockname, sizeof(cnl->dst));
 
 		proc_compose(env->sc_ps, PROC_PFE, IMSG_NATLOOK,
 		    cnl, sizeof(*cnl));
@@ -1399,7 +1441,7 @@ relay_session(struct rsession *con)
 		 * Call the UDP protocol-specific handler
 		 */
 		if (rlay->rl_proto->request == NULL)
-			fatalx("invalide UDP session");
+			fatalx("invalid UDP session");
 		if ((*rlay->rl_proto->request)(con) == -1)
 			relay_close(con, "session failed", 1);
 		return;
@@ -1410,13 +1452,7 @@ relay_session(struct rsession *con)
 		return;
 	}
 
-	if (rlay->rl_proto->type == RELAY_PROTO_HTTP) {
-		if (relay_http_priv_init(con) == -1) {
-			relay_close(con,
-			    "failed to allocate http session data", 1);
-			return;
-		}
-	} else {
+	if (rlay->rl_proto->type != RELAY_PROTO_HTTP) {
 		if (rlay->rl_conf.fwdmode == FWD_TRANS)
 			relay_bindanyreq(con, 0, IPPROTO_TCP);
 		else if (relay_connect(con) == -1) {
@@ -1462,6 +1498,17 @@ relay_bindany(int fd, short event, void *arg)
 	}
 	if (relay_connect(con) == -1)
 		relay_close(con, "session failed", 1);
+}
+
+void
+relay_connect_state(struct rsession *con, struct ctl_relay_event *cre,
+    enum relay_state new)
+{
+	DPRINTF("%s: session %d: %s state %s -> %s",
+	    __func__, con->se_id,
+	    cre->dir == RELAY_DIR_REQUEST ? "accept" : "connect",
+	    relay_state(cre->state), relay_state(new));
+	cre->state = new;
 }
 
 void
@@ -1533,9 +1580,9 @@ relay_connect_retry(int fd, short sig, void *arg)
 	}
 
 	if (rlay->rl_conf.flags & F_TLSINSPECT)
-		con->se_out.state = STATE_PRECONNECT;
+		relay_connect_state(con, &con->se_out, STATE_PRECONNECT);
 	else
-		con->se_out.state = STATE_CONNECTED;
+		relay_connect_state(con, &con->se_out, STATE_CONNECTED);
 	relay_inflight--;
 	DPRINTF("%s: inflight decremented, now %d",__func__, relay_inflight);
 
@@ -1560,7 +1607,7 @@ relay_preconnect(struct rsession *con)
 	    con->se_id, privsep_process);
 	rv = relay_connect(con);
 	if (con->se_out.state == STATE_CONNECTED)
-		con->se_out.state = STATE_PRECONNECT;
+		relay_connect_state(con, &con->se_out, STATE_PRECONNECT);
 	return (rv);
 }
 
@@ -1585,7 +1632,7 @@ relay_connect(struct rsession *con)
 			return (-1);
 		}
 		relay_connected(con->se_out.s, EV_WRITE, con);
-		con->se_out.state = STATE_CONNECTED;
+		relay_connect_state(con, &con->se_out, STATE_CONNECTED);
 		return (0);
 	}
 
@@ -1596,7 +1643,8 @@ relay_connect(struct rsession *con)
 
 	getmonotime(&con->se_tv_start);
 
-	if (!TAILQ_EMPTY(&rlay->rl_tables)) {
+	if (con->se_out.ss.ss_family == AF_UNSPEC &&
+	    !TAILQ_EMPTY(&rlay->rl_tables)) {
 		if (relay_from_table(con) != 0)
 			return (-1);
 	} else if (con->se_out.ss.ss_family == AF_UNSPEC) {
@@ -1642,7 +1690,7 @@ relay_connect(struct rsession *con)
 			evtimer_add(&rlay->rl_evt, &evtpause);
 
 			/* this connect is pending */
-			con->se_out.state = STATE_PENDING;
+			relay_connect_state(con, &con->se_out, STATE_PENDING);
 			return (0);
 		} else {
 			if (con->se_retry) {
@@ -1660,7 +1708,7 @@ relay_connect(struct rsession *con)
 		}
 	}
 
-	con->se_out.state = STATE_CONNECTED;
+	relay_connect_state(con, &con->se_out, STATE_CONNECTED);
 	relay_inflight--;
 	DPRINTF("%s: inflight decremented, now %d",__func__,
 	    relay_inflight);
@@ -1686,10 +1734,6 @@ relay_close(struct rsession *con, const char *msg, int err)
 	relay_session_unpublish(con);
 
 	event_del(&con->se_ev);
-	if (con->se_in.bev != NULL)
-		bufferevent_disable(con->se_in.bev, EV_READ|EV_WRITE);
-	if (con->se_out.bev != NULL)
-		bufferevent_disable(con->se_out.bev, EV_READ|EV_WRITE);
 
 	if ((env->sc_conf.opts & (RELAYD_OPT_LOGCON|RELAYD_OPT_LOGCONERR)) &&
 	    msg != NULL) {
@@ -1726,7 +1770,8 @@ relay_close(struct rsession *con, const char *msg, int err)
 
 	free(con->se_priv);
 
-	if (relay_reset_event(&con->se_in)) {
+	relay_connect_state(con, &con->se_in, STATE_DONE);
+	if (relay_reset_event(con, &con->se_in)) {
 		if (con->se_out.s == -1) {
 			/*
 			 * the output was never connected,
@@ -1740,7 +1785,8 @@ relay_close(struct rsession *con, const char *msg, int err)
 	if (con->se_in.output != NULL)
 		evbuffer_free(con->se_in.output);
 
-	if (relay_reset_event(&con->se_out)) {
+	relay_connect_state(con, &con->se_out, STATE_DONE);
+	if (relay_reset_event(con, &con->se_out)) {
 		/* Some file descriptors are available again. */
 		if (evtimer_pending(&rlay->rl_evt, NULL)) {
 			evtimer_del(&rlay->rl_evt);
@@ -1766,14 +1812,16 @@ relay_close(struct rsession *con, const char *msg, int err)
 }
 
 int
-relay_reset_event(struct ctl_relay_event *cre)
+relay_reset_event(struct rsession *con, struct ctl_relay_event *cre)
 {
 	int		 rv = 0;
 
-	DPRINTF("%s: state %d dir %d", __func__, cre->state, cre->dir);
-
-	if (cre->bev != NULL)
+	if (cre->state != STATE_DONE)
+		relay_connect_state(con, cre, STATE_CLOSED);
+	if (cre->bev != NULL) {
+		bufferevent_disable(cre->bev, EV_READ|EV_WRITE);
 		bufferevent_free(cre->bev);
+	}
 	if (cre->tls != NULL)
 		tls_close(cre->tls);
 	tls_free(cre->tls);
@@ -1784,7 +1832,6 @@ relay_reset_event(struct ctl_relay_event *cre)
 		close(cre->s);
 		rv = 1;
 	}
-	cre->state = STATE_DONE;
 	cre->bev = NULL;
 	cre->tls = NULL;
 	cre->tls_cfg = NULL;
@@ -1946,7 +1993,7 @@ relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 		}
 
 		/* Will validate the result later */
-		con->se_bnds = imsg->fd;
+		con->se_bnds = imsg_get_fd(imsg);
 
 		evtimer_del(&con->se_ev);
 		evtimer_set(&con->se_ev, relay_bindany, con);
@@ -2017,13 +2064,11 @@ relay_tls_ctx_create_proto(struct protocol *proto, struct tls_config *tls_cfg)
 {
 	uint32_t		 protocols = 0;
 
-	/* Set the allowed SSL protocols */
-	if (proto->tlsflags & TLSFLAG_TLSV1_0)
-		protocols |= TLS_PROTOCOL_TLSv1_0;
-	if (proto->tlsflags & TLSFLAG_TLSV1_1)
-		protocols |= TLS_PROTOCOL_TLSv1_1;
+	/* Set the allowed TLS protocols */
 	if (proto->tlsflags & TLSFLAG_TLSV1_2)
 		protocols |= TLS_PROTOCOL_TLSv1_2;
+	if (proto->tlsflags & TLSFLAG_TLSV1_3)
+		protocols |= TLS_PROTOCOL_TLSv1_3;
 	if (tls_config_set_protocols(tls_cfg, protocols) == -1) {
 		log_warnx("could not set the TLS protocol: %s",
 		    tls_config_error(tls_cfg));
@@ -2041,7 +2086,7 @@ relay_tls_ctx_create_proto(struct protocol *proto, struct tls_config *tls_cfg)
 
 	/*
 	 * Set session ID context to a random value. It needs to be the
-	 * same accross all relay processes or session caching will fail.
+	 * same across all relay processes or session caching will fail.
 	 */
 	if (tls_config_set_session_id(tls_cfg, env->sc_conf.tls_sid,
 	    sizeof(env->sc_conf.tls_sid)) == -1) {
@@ -2079,17 +2124,17 @@ relay_tls_ctx_create_proto(struct protocol *proto, struct tls_config *tls_cfg)
  * This function is not publicy exported because it is a hack until libtls
  * has a proper privsep setup
  */
-void tls_config_skip_private_key_check(struct tls_config *config);
+void tls_config_use_fake_private_key(struct tls_config *config);
 
 int
 relay_tls_ctx_create(struct relay *rlay)
 {
 	struct tls_config	*tls_cfg, *tls_client_cfg;
 	struct tls		*tls = NULL;
-	const char		*fake_key;
-	int			 fake_keylen;
-	char			*buf = NULL, *cabuf = NULL;
-	off_t			 len = 0, calen = 0;
+	struct relay_cert	*cert;
+	int			 keyfound = 0;
+	char			*buf = NULL, *cabuf = NULL, *ocspbuf = NULL;
+	off_t			 len = 0, calen = 0, ocsplen = 0;
 
 	if ((tls_cfg = tls_config_new()) == NULL) {
 		log_warnx("unable to allocate TLS config");
@@ -2114,11 +2159,11 @@ relay_tls_ctx_create(struct relay *rlay)
 		tls_config_insecure_noverifyname(tls_client_cfg);
 
 		if (rlay->rl_tls_ca_fd != -1) {
-			if ((buf = relay_load_fd(rlay->rl_tls_ca_fd, &len)) ==
-			    NULL) {
+			if ((buf = relay_load_fd(rlay->rl_tls_ca_fd, &len)) == NULL) {
 				log_warn("failed to read root certificates");
 				goto err;
 			}
+			rlay->rl_tls_ca_fd = -1;
 
 			if (tls_config_set_ca_mem(tls_client_cfg, buf, len) !=
 			    0) {
@@ -2140,31 +2185,57 @@ relay_tls_ctx_create(struct relay *rlay)
 		/*
 		 * Use the public key as the "private" key - the secret key
 		 * parameters are hidden in an extra process that will be
-		 * contacted by the RSA engine.  The SSL/TLS library needs at
+		 * contacted by the RSA engine.  The TLS library needs at
 		 * least the public key parameters in the current process.
-		 * For this we need to skip the private key check done by
-		 * libtls.
 		 */
-		tls_config_skip_private_key_check(tls_cfg);
+		tls_config_use_fake_private_key(tls_cfg);
 
-		if ((buf = relay_load_fd(rlay->rl_tls_cert_fd, &len)) == NULL) {
-			log_warn("failed to load tls certificate");
-			goto err;
+		TAILQ_FOREACH(cert, env->sc_certs, cert_entry) {
+			if (cert->cert_relayid != rlay->rl_conf.id ||
+			    cert->cert_fd == -1)
+				continue;
+			keyfound++;
+
+			if ((buf = relay_load_fd(cert->cert_fd,
+			    &len)) == NULL) {
+				log_warn("failed to load tls certificate");
+				goto err;
+			}
+			cert->cert_fd = -1;
+
+			if (cert->cert_ocsp_fd != -1 &&
+			    (ocspbuf = relay_load_fd(cert->cert_ocsp_fd,
+			    &ocsplen)) == NULL) {
+				log_warn("failed to load OCSP staplefile");
+				goto err;
+			}
+			if (ocsplen == 0)
+				purge_key(&ocspbuf, ocsplen);
+			cert->cert_ocsp_fd = -1;
+
+			if (keyfound == 1 &&
+			    tls_config_set_keypair_ocsp_mem(tls_cfg, buf, len,
+			    NULL, 0, ocspbuf, ocsplen) != 0) {
+				log_warnx("failed to set tls certificate: %s",
+				    tls_config_error(tls_cfg));
+				goto err;
+			}
+
+			/* loading certificate public key */
+			if (keyfound == 1 &&
+			    !ssl_load_pkey(buf, len, NULL, &rlay->rl_tls_pkey))
+				goto err;
+
+			if (tls_config_add_keypair_ocsp_mem(tls_cfg, buf, len,
+			    NULL, 0, ocspbuf, ocsplen) != 0) {
+				log_warnx("failed to add tls certificate: %s",
+				    tls_config_error(tls_cfg));
+				goto err;
+			}
+
+			purge_key(&buf, len);
+			purge_key(&ocspbuf, ocsplen);
 		}
-
-		if ((fake_keylen = ssl_ctx_fake_private_key(buf, len,
-		    &fake_key)) == -1) {
-			/* error already printed */
-			goto err;
-		}
-
-		if (tls_config_set_keypair_ocsp_mem(tls_cfg, buf, len,
-		    fake_key, fake_keylen, NULL, 0) != 0) {
-			log_warnx("failed to set tls certificate: %s",
-			    tls_config_error(tls_cfg));
-			goto err;
-		}
-
 
 		if (rlay->rl_tls_cacert_fd != -1) {
 			if ((cabuf = relay_load_fd(rlay->rl_tls_cacert_fd,
@@ -2176,11 +2247,28 @@ relay_tls_ctx_create(struct relay *rlay)
 			if (!ssl_load_pkey(cabuf, calen,
 			    &rlay->rl_tls_cacertx509, &rlay->rl_tls_capkey))
 				goto err;
-			/* loading certificate public key */
-			log_debug("%s: loading certificate", __func__);
-			if (!ssl_load_pkey(buf, len, NULL, &rlay->rl_tls_pkey))
-				goto err;
 		}
+		rlay->rl_tls_cacert_fd = -1;
+
+		if (rlay->rl_tls_client_ca_fd != -1) {
+			if ((buf = relay_load_fd(rlay->rl_tls_client_ca_fd,
+			    &len)) == NULL) {
+				log_warn(
+				    "failed to read tls client CA certificate");
+				goto err;
+			}
+
+			if (tls_config_set_ca_mem(tls_cfg, buf, len) != 0) {
+				log_warnx(
+				    "failed to set tls client CA cert: %s",
+				    tls_config_error(tls_cfg));
+				goto err;
+			}
+			purge_key(&buf, len);
+
+			tls_config_verify_client(tls_cfg);
+		}
+		rlay->rl_tls_client_ca_fd = -1;
 
 		tls = tls_server();
 		if (tls == NULL) {
@@ -2197,13 +2285,7 @@ relay_tls_ctx_create(struct relay *rlay)
 		rlay->rl_tls_ctx = tls;
 
 		purge_key(&cabuf, calen);
-		purge_key(&buf, len);
 	}
-
-	/* The fd for the keys/certs are not needed anymore */
-	close(rlay->rl_tls_cert_fd);
-	close(rlay->rl_tls_cacert_fd);
-	close(rlay->rl_tls_ca_fd);
 
 	if (rlay->rl_tls_client_cfg == NULL)
 		tls_config_free(tls_client_cfg);
@@ -2212,6 +2294,7 @@ relay_tls_ctx_create(struct relay *rlay)
 
 	return (0);
  err:
+	purge_key(&ocspbuf, ocsplen);
 	purge_key(&cabuf, calen);
 	purge_key(&buf, len);
 
@@ -2225,8 +2308,6 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 {
 	struct tls_config	*tls_cfg;
 	struct tls		*tls = NULL;
-	const char		*fake_key;
-	int			 fake_keylen;
 
 	/* TLS inspection: use session-specific certificate */
 	if ((tls_cfg = tls_config_new()) == NULL) {
@@ -2238,17 +2319,10 @@ relay_tls_inspect_create(struct relay *rlay, struct ctl_relay_event *cre)
 		goto err;
 	}
 
-	tls_config_skip_private_key_check(tls_cfg);
+	tls_config_use_fake_private_key(tls_cfg);
 
-	log_debug("%s: loading intercepted certificate", __func__);
-	if ((fake_keylen = ssl_ctx_fake_private_key(cre->tlscert,
-	    cre->tlscert_len, &fake_key)) == -1) {
-		/* error already printed */
-		goto err;
-	}
 	if (tls_config_set_keypair_ocsp_mem(tls_cfg,
-	    cre->tlscert, cre->tlscert_len, fake_key, fake_keylen,
-	    NULL, 0) != 0) {
+	    cre->tlscert, cre->tlscert_len, NULL, 0, NULL, 0) != 0) {
 		log_warnx("failed to set tls certificate: %s",
 		    tls_config_error(tls_cfg));
 		goto err;
@@ -2435,7 +2509,7 @@ relay_tls_readcb(int fd, short event, void *arg)
 	ret = tls_read(cre->tls, rbuf, howmuch);
 	if (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT) {
 		goto retry;
-	} else if (ret < 0) {
+	} else if (ret == -1) {
 		what |= EVBUFFER_ERROR;
 		goto err;
 	}
@@ -2494,7 +2568,7 @@ relay_tls_writecb(int fd, short event, void *arg)
 		    EVBUFFER_LENGTH(bufev->output));
 		if (ret == TLS_WANT_POLLIN || ret == TLS_WANT_POLLOUT) {
 			goto retry;
-		} else if (ret < 0) {
+		} else if (ret == -1) {
 			what |= EVBUFFER_ERROR;
 			goto err;
 		}
@@ -2574,7 +2648,7 @@ relay_bufferevent_write_chunk(struct ctl_relay_event *cre,
     struct evbuffer *buf, size_t size)
 {
 	int ret;
-	ret = relay_bufferevent_write(cre, buf->buffer, size);
+	ret = relay_bufferevent_write(cre, EVBUFFER_DATA(buf), size);
 	if (ret != -1)
 		evbuffer_drain(buf, size);
 	return (ret);
@@ -2621,105 +2695,6 @@ relay_cmp_af(struct sockaddr_storage *a, struct sockaddr_storage *b)
 	}
 
 	return (ret);
-}
-
-char *
-relay_load_fd(int fd, off_t *len)
-{
-	char		*buf = NULL;
-	struct stat	 st;
-	off_t		 size;
-	ssize_t		 rv;
-	int		 err;
-
-	if (fstat(fd, &st) != 0)
-		goto fail;
-	size = st.st_size;
-	if ((buf = calloc(1, size + 1)) == NULL)
-		goto fail;
-	if ((rv = pread(fd, buf, size, 0)) != size)
-		goto fail;
-
-	close(fd);
-
-	*len = size;
-	return (buf);
-
- fail:
-	err = errno;
-	free(buf);
-	close(fd);
-	errno = err;
-	return (NULL);
-}
-
-int
-relay_load_certfiles(struct relay *rlay)
-{
-	char	 certfile[PATH_MAX];
-	char	 hbuf[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
-	struct protocol *proto = rlay->rl_proto;
-	int	 useport = htons(rlay->rl_conf.port);
-
-	if (rlay->rl_conf.flags & F_TLSCLIENT) {
-		if (strlen(proto->tlsca)) {
-			if ((rlay->rl_tls_ca_fd =
-			    open(proto->tlsca, O_RDONLY)) == -1)
-				return (-1);
-			log_debug("%s: using ca %s", __func__, proto->tlsca);
-		}
-		if (strlen(proto->tlscacert)) {
-			if ((rlay->rl_tls_cacert_fd =
-			    open(proto->tlscacert, O_RDONLY)) == -1)
-				return (-1);
-			log_debug("%s: using ca certificate %s", __func__,
-			    proto->tlscacert);
-		}
-		if (strlen(proto->tlscakey) && proto->tlscapass != NULL) {
-			if ((rlay->rl_tls_cakey =
-			    ssl_load_key(env, proto->tlscakey,
-			    &rlay->rl_conf.tls_cakey_len,
-			    proto->tlscapass)) == NULL)
-				return (-1);
-			log_debug("%s: using ca key %s", __func__,
-			    proto->tlscakey);
-		}
-	}
-
-	if ((rlay->rl_conf.flags & F_TLS) == 0)
-		return (0);
-
-	if (print_host(&rlay->rl_conf.ss, hbuf, sizeof(hbuf)) == NULL)
-		return (-1);
-
-	if (snprintf(certfile, sizeof(certfile),
-	    "/etc/ssl/%s:%u.crt", hbuf, useport) == -1)
-		return (-1);
-	if ((rlay->rl_tls_cert_fd = open(certfile, O_RDONLY)) == -1) {
-		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/%s.crt", hbuf) == -1)
-			return (-1);
-		if ((rlay->rl_tls_cert_fd = open(certfile, O_RDONLY)) == -1)
-			return (-1);
-		useport = 0;
-	}
-	log_debug("%s: using certificate %s", __func__, certfile);
-
-	if (useport) {
-		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/private/%s:%u.key", hbuf, useport) == -1)
-			return -1;
-	} else {
-		if (snprintf(certfile, sizeof(certfile),
-		    "/etc/ssl/private/%s.key", hbuf) == -1)
-			return -1;
-	}
-	if ((rlay->rl_tls_key = ssl_load_key(env, certfile,
-	    &rlay->rl_conf.tls_key_len, NULL)) == NULL)
-		return (-1);
-	log_debug("%s: using private key %s", __func__, certfile);
-
-	return (0);
 }
 
 int

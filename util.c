@@ -1,4 +1,4 @@
-/*	$OpenBSD: util.c,v 1.1 2015/11/21 12:37:42 reyk Exp $	*/
+/*	$OpenBSD: util.c,v 1.5 2024/09/20 02:00:46 jsg Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2015 Reyk Floeter <reyk@openbsd.org>
@@ -149,7 +149,7 @@ host_status(enum host_status status)
 		return ("unknown");
 	case HOST_UP:
 		return ("up");
-	};
+	}
 	/* NOTREACHED */
 	return ("invalid");
 }
@@ -168,14 +168,38 @@ table_check(enum table_check check)
 		return ("http code");
 	case CHECK_HTTP_DIGEST:
 		return ("http digest");
+	case CHECK_BINSEND_EXPECT:
 	case CHECK_SEND_EXPECT:
 		return ("send expect");
 	case CHECK_SCRIPT:
 		return ("script");
-	};
+	}
 	/* NOTREACHED */
 	return ("invalid");
 }
+
+#ifdef DEBUG
+const char *
+relay_state(enum relay_state state)
+{
+	switch (state) {
+	case STATE_INIT:
+		return ("init");
+	case STATE_PENDING:
+		return ("pending");
+	case STATE_PRECONNECT:
+		return ("preconnect");
+	case STATE_CONNECTED:
+		return ("connected");
+	case STATE_CLOSED:
+		return ("closed");
+	case STATE_DONE:
+		return ("done");
+	}
+	/* NOTREACHED */
+	return ("invalid");
+}
+#endif
 
 const char *
 print_availability(u_long cnt, u_long up)
@@ -260,4 +284,77 @@ getmonotime(struct timeval *tv)
 		fatal("clock_gettime");
 
 	TIMESPEC_TO_TIMEVAL(tv, &ts);
+}
+
+struct ibuf *
+string2binary(const char *string)
+{
+	struct ibuf	*ibuf = NULL;
+	unsigned char	 ch, r;
+	size_t		 i, len;
+
+	len = strlen(string);
+	if (len % 2 != 0)
+		goto fail;
+	if ((ibuf = ibuf_open(len / 2)) == NULL)
+		goto fail;
+
+	while (*string) {
+		r = 0;
+		for (i = 0; i < 2; i++) {
+			ch = string[i];
+			if (isdigit(ch))
+				ch -= '0';
+			else if (islower(ch))
+				ch -= ('a' - 10);
+			else if (isupper(ch))
+				ch -= ('A' - 10);
+			else
+				goto fail;
+			if (ch > 0xf)
+				goto fail;
+			r = r << 4 | ch;
+		}
+		if (ibuf_add_n8(ibuf, r) == -1)
+			goto fail;
+		string += 2;
+	}
+
+	return ibuf;
+
+fail:
+	ibuf_free(ibuf);
+	return NULL;
+}
+
+void
+print_hex(uint8_t *buf, off_t offset, size_t length)
+{
+	unsigned int	 i;
+
+	if (log_getverbose() < 3 || !length)
+		return;
+
+	for (i = 0; i < length; i++) {
+		if (i && (i % 4) == 0) {
+			if ((i % 32) == 0)
+				print_debug("\n");
+			else
+				print_debug(" ");
+		}
+		print_debug("%02x", buf[offset + i]);
+	}
+	print_debug("\n");
+}
+
+void
+print_debug(const char *emsg, ...)
+{
+	va_list	 ap;
+
+	if (log_getverbose() > 2) {
+		va_start(ap, emsg);
+		vfprintf(stderr, emsg, ap);
+		va_end(ap);
+	}
 }

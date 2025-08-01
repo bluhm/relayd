@@ -1,4 +1,4 @@
-/*	$OpenBSD: relay_http.c,v 1.72 2019/03/04 21:25:03 benno Exp $	*/
+/*	$OpenBSD: relay_http.c,v 1.90 2024/07/20 06:54:15 anton Exp $	*/
 
 /*
  * Copyright (c) 2006 - 2016 Reyk Floeter <reyk@openbsd.org>
@@ -71,10 +71,13 @@ int		 relay_httpurl_test(struct ctl_relay_event *,
 		    struct relay_rule *, struct kvlist *);
 int		 relay_httpcookie_test(struct ctl_relay_event *,
 		    struct relay_rule *, struct kvlist *);
-int		 relay_apply_actions(struct ctl_relay_event *, struct kvlist *);
+int		 relay_apply_actions(struct ctl_relay_event *, struct kvlist *,
+		    struct relay_table *);
 int		 relay_match_actions(struct ctl_relay_event *,
-		    struct relay_rule *, struct kvlist *, struct kvlist *);
+		    struct relay_rule *, struct kvlist *, struct kvlist *,
+		    struct relay_table **);
 void		 relay_httpdesc_free(struct http_descriptor *);
+char *		 server_root_strip(char *, int);
 
 static struct relayd	*env = NULL;
 
@@ -112,12 +115,16 @@ relay_http_init(struct relay *rlay)
 int
 relay_http_priv_init(struct rsession *con)
 {
-	struct relay_http_priv	*p;
-	if ((p = calloc(1, sizeof(struct relay_http_priv))) == NULL)
-		return (-1);
 
-	con->se_priv = p;
-	return (0);
+	struct http_session	*hs;
+
+	if ((hs = calloc(1, sizeof(*hs))) == NULL)
+		return (-1);
+	SIMPLEQ_INIT(&hs->hs_methods);
+	DPRINTF("%s: session %d http_session %p", __func__,
+		con->se_id, hs);
+	con->se_priv = hs;
+	return (relay_httpdesc_init(&con->se_in));
 }
 
 int
@@ -154,6 +161,20 @@ relay_httpdesc_free(struct http_descriptor *desc)
 	desc->http_lastheader = NULL;
 }
 
+static int
+relay_http_header_name_valid(const char *name)
+{
+	/*
+	 * RFC 9110 specifies that only the following characters are
+	 * permitted within HTTP header field names.
+	 */
+	const char token_chars[] = "!#$%&'*+-.^_`|~0123456789"
+	    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	const size_t len = strspn(name, token_chars);
+
+	return (name[len] == '\0');
+}
+
 void
 relay_read_http(struct bufferevent *bev, void *arg)
 {
@@ -163,13 +184,18 @@ relay_read_http(struct bufferevent *bev, void *arg)
 	struct relay		*rlay = con->se_relay;
 	struct protocol		*proto = rlay->rl_proto;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
-	struct relay_http_priv	*priv = con->se_priv;
 	char			*line = NULL, *key, *value;
 	char			*urlproto, *host, *path;
 	int			 action, unique, ret;
 	const char		*errstr;
 	size_t			 size, linelen;
 	struct kv		*hdr = NULL;
+	struct kv		*upgrade = NULL, *upgrade_ws = NULL;
+	struct kv		*connection_close = NULL;
+	int			 ws_response = 0;
+	struct http_method_node	*hmn;
+	struct http_session	*hs;
+	enum httpmethod		 request_method;
 
 	getmonotime(&con->se_tv_last);
 	cre->timedout = 0;
@@ -184,10 +210,15 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		goto done;
 	}
 
-	while (!cre->done) {
+	for (;;) {
 		line = evbuffer_readln(src, &linelen, EVBUFFER_EOL_CRLF);
-		if (line == NULL)
+		if (line == NULL) {
+			/*
+			 * We do not process the last header on premature
+			 * EOF as it may not be complete.
+			 */
 			break;
+		}
 
 		/*
 		 * An empty line indicates the end of the request.
@@ -196,35 +227,168 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		if (linelen == 0) {
 			cre->done = 1;
 			free(line);
+			line = NULL;
+			if (cre->line > 1) {
+				/* Process last (complete) header line. */
+				goto last_header;
+			}
 			break;
 		}
-		key = line;
 
 		/* Limit the total header length minus \r\n */
 		cre->headerlen += linelen;
 		if (cre->headerlen > proto->httpheaderlen) {
-			free(line);
 			relay_abort_http(con, 413,
 			    "request headers too large", 0);
-			return;
+			goto abort;
 		}
+
+		/* Reject requests with an embedded NUL byte. */
+		if (memchr(line, '\0', linelen) != NULL) {
+			relay_abort_http(con, 400, "malformed", 0);
+			goto abort;
+		}
+
+		hs = con->se_priv;
+		DPRINTF("%s: session %d http_session %p", __func__,
+			con->se_id, hs);
 
 		/*
 		 * The first line is the GET/POST/PUT/... request,
 		 * subsequent lines are HTTP headers.
 		 */
-		if (++cre->line == 1)
-			value = strchr(key, ' ');
-		else if (*key == ' ' || *key == '\t')
-			/* Multiline headers wrap with a space or tab */
-			value = NULL;
-		else
-			value = strchr(key, ':');
-		if (value == NULL) {
-			if (cre->line <= 2) {
-				free(line);
+		if (++cre->line == 1) {
+			key = line;
+			if ((value = strchr(key, ' ')) == NULL) {
 				relay_abort_http(con, 400, "malformed", 0);
-				return;
+				goto abort;
+			}
+			*value++ = '\0';
+
+			if (cre->dir == RELAY_DIR_RESPONSE) {
+				desc->http_method = HTTP_METHOD_RESPONSE;
+				hmn = SIMPLEQ_FIRST(&hs->hs_methods);
+
+				/*
+				 * There is nothing preventing the relay from
+				 * sending an unbalanced response.  Be prepared.
+				 */
+				if (hmn == NULL) {
+					request_method = HTTP_METHOD_NONE;
+					DPRINTF("%s: session %d unbalanced "
+					    "response", __func__, con->se_id);
+				} else {
+					SIMPLEQ_REMOVE_HEAD(&hs->hs_methods,
+					    hmn_entry);
+					request_method = hmn->hmn_method;
+					DPRINTF("%s: session %d dequeuing %s",
+					    __func__, con->se_id,
+					    relay_httpmethod_byid(request_method));
+					free(hmn);
+				}
+
+				/*
+				 * Decode response path and query
+				 */
+				desc->http_version = strdup(key);
+				if (desc->http_version == NULL) {
+					free(line);
+					goto fail;
+				}
+				desc->http_rescode = strdup(value);
+				if (desc->http_rescode == NULL) {
+					free(line);
+					goto fail;
+				}
+				desc->http_resmesg = strchr(desc->http_rescode,
+				    ' ');
+				if (desc->http_resmesg == NULL) {
+					free(line);
+					goto fail;
+				}
+				*desc->http_resmesg++ = '\0';
+				desc->http_resmesg = strdup(desc->http_resmesg);
+				if (desc->http_resmesg == NULL) {
+					free(line);
+					goto fail;
+				}
+				desc->http_status = strtonum(desc->http_rescode,
+				    100, 599, &errstr);
+				if (errstr) {
+					DPRINTF(
+					    "%s: http_status %s: errno %d, %s",
+					    __func__, desc->http_rescode, errno,
+					    errstr);
+					free(line);
+					goto fail;
+				}
+				DPRINTF("http_version %s http_rescode %s "
+				    "http_resmesg %s", desc->http_version,
+				    desc->http_rescode, desc->http_resmesg);
+			} else if (cre->dir == RELAY_DIR_REQUEST) {
+				desc->http_method =
+				    relay_httpmethod_byname(key);
+				if (desc->http_method == HTTP_METHOD_NONE) {
+					free(line);
+					goto fail;
+				}
+				if ((hmn = calloc(1, sizeof *hmn)) == NULL) {
+					free(line);
+					goto fail;
+				}
+				hmn->hmn_method = desc->http_method;
+				DPRINTF("%s: session %d enqueuing %s",
+				    __func__, con->se_id,
+				    relay_httpmethod_byid(hmn->hmn_method));
+				SIMPLEQ_INSERT_TAIL(&hs->hs_methods, hmn,
+				    hmn_entry);
+				/*
+				 * Decode request path and query
+				 */
+				desc->http_path = strdup(value);
+				if (desc->http_path == NULL) {
+					free(line);
+					goto fail;
+				}
+				desc->http_version = strchr(desc->http_path,
+				    ' ');
+				if (desc->http_version == NULL) {
+					free(line);
+					goto fail;
+				}
+				*desc->http_version++ = '\0';
+				desc->http_query = strchr(desc->http_path, '?');
+				if (desc->http_query != NULL)
+					*desc->http_query++ = '\0';
+
+				/*
+				 * Have to allocate the strings because they
+				 * could be changed independently by the
+				 * filters later.
+				 */
+				if ((desc->http_version =
+				    strdup(desc->http_version)) == NULL) {
+					free(line);
+					goto fail;
+				}
+				if (desc->http_query != NULL &&
+				    (desc->http_query =
+				    strdup(desc->http_query)) == NULL) {
+					free(line);
+					goto fail;
+				}
+			}
+
+			free(line);
+			continue;
+		}
+
+		/* Multiline headers wrap with a space or tab. */
+		if (*line == ' ' || *line == '\t') {
+			if (cre->line == 2) {
+				/* First header line cannot start with space. */
+				relay_abort_http(con, 400, "malformed", 0);
+				goto abort;
 			}
 
 			/* Append line to the last header, if present */
@@ -237,189 +401,144 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			free(line);
 			continue;
 		}
-		if (*value == ':') {
-			*value++ = '\0';
-			value += strspn(value, " \t\r\n");
-		} else {
-			*value++ = '\0';
-		}
 
-		DPRINTF("%s: session %d: header '%s: %s'", __func__,
-		    con->se_id, key, value);
+		/* Process the last complete header line. */
+ last_header:
+		if (desc->http_lastheader != NULL) {
+			key = desc->http_lastheader->kv_key;
+			value = desc->http_lastheader->kv_value;
 
-		/*
-		 * Identify and handle specific HTTP request methods
-		 */
-		if (cre->line == 1 && cre->dir == RELAY_DIR_RESPONSE) {
-			desc->http_method = HTTP_METHOD_RESPONSE;
-			/*
-			 * Decode response path and query
-			 */
-			desc->http_version = strdup(line);
-			if (desc->http_version == NULL) {
-				free(line);
-				goto fail;
-			}
-			desc->http_rescode = strdup(value);
-			if (desc->http_rescode == NULL) {
-				free(line);
-				goto fail;
-			}
-			desc->http_resmesg = strchr(desc->http_rescode, ' ');
-			if (desc->http_resmesg == NULL) {
-				free(line);
-				goto fail;
-			}
-			*desc->http_resmesg++ = '\0';
-			if ((desc->http_resmesg = strdup(desc->http_resmesg))
-			    == NULL) {
-				free(line);
-				goto fail;
-			}
-			desc->http_status = strtonum(desc->http_rescode, 100,
-			    599, &errstr);
-			if (errstr) {
-				DPRINTF("%s: http_status %s: errno %d, %s",
-				    __func__, desc->http_rescode, errno,
-				    errstr);
-				free(line);
-				goto fail;
-			}
-			DPRINTF("http_version %s http_rescode %s "
-			    "http_resmesg %s", desc->http_version,
-			    desc->http_rescode, desc->http_resmesg);
-			goto lookup;
-		} else if (cre->line == 1 && cre->dir == RELAY_DIR_REQUEST) {
-			if ((desc->http_method = relay_httpmethod_byname(key))
-			    == HTTP_METHOD_NONE) {
-				free(line);
-				goto fail;
-			}
-			/*
-			 * Decode request path and query
-			 */
-			desc->http_path = strdup(value);
-			if (desc->http_path == NULL) {
-				free(line);
-				goto fail;
-			}
-			desc->http_version = strchr(desc->http_path, ' ');
-			if (desc->http_version == NULL) {
-				free(line);
-				goto fail;
-			}
-			*desc->http_version++ = '\0';
-			desc->http_query = strchr(desc->http_path, '?');
-			if (desc->http_query != NULL)
-				*desc->http_query++ = '\0';
+			DPRINTF("%s: session %d: header '%s: %s'", __func__,
+			    con->se_id, key, value);
 
-			/*
-			 * Have to allocate the strings because they could
-			 * be changed independently by the filters later.
-			 */
-			if ((desc->http_version =
-			    strdup(desc->http_version)) == NULL) {
-				free(line);
-				goto fail;
-			}
-			if (desc->http_query != NULL &&
-			    (desc->http_query =
-			    strdup(desc->http_query)) == NULL) {
-				free(line);
-				goto fail;
-			}
-		} else if (desc->http_method != HTTP_METHOD_NONE &&
-		    strcasecmp("Content-Length", key) == 0) {
-			/*
-			 * These methods should not have a body
-			 * and thus no Content-Length header.
-			 */
-			if (desc->http_method == HTTP_METHOD_TRACE ||
-			    desc->http_method == HTTP_METHOD_CONNECT) {
-				relay_abort_http(con, 400, "malformed", 0);
-				goto abort;
-			}
-			/*
-			 * Need to read data from the client after the
-			 * HTTP header.
-			 * XXX What about non-standard clients not using
-			 * the carriage return? And some browsers seem to
-			 * include the line length in the content-length.
-			 */
-			cre->toread = strtonum(value, 0, LLONG_MAX, &errstr);
-			if (errstr) {
-				relay_abort_http(con, 500, errstr, 0);
-				goto abort;
-			}
-			/*
-			 * response with a status code of 1xx
-			 * (Informational) or 204 (No Content) MUST
-			 * not have a Content-Length (rfc 7230 3.3.3)
-			 * Instead we check for value != 0 because there are
-			 * servers that do not follow the rfc and send
-			 * Content-Length: 0.
-			 */
-			if (desc->http_method == HTTP_METHOD_RESPONSE && (
-			    ((desc->http_status >= 100 &&
-			    desc->http_status < 200) ||
-			    desc->http_status == 204)) &&
-			    cre->toread != 0) {
-				relay_abort_http(con, 502,
-				    "Bad Gateway", 0);
-				goto abort;
-			}
-		}
- lookup:
-		if (strcasecmp("Transfer-Encoding", key) == 0 &&
-		    strcasecmp("chunked", value) == 0)
-			desc->http_chunked = 1;
-
-		/* The following header should only occur once */
-		if (strcasecmp("Host", key) == 0) {
-			unique = 1;
-
-			/*
-			 * The path may contain a URL.  The host in the
-			 * URL has to match the Host: value.
-			 */
-			if (parse_url(desc->http_path,
-			    &urlproto, &host, &path) == 0) {
-				ret = strcasecmp(host, value);
-				free(urlproto);
-				free(host);
-				free(path);
-				if (ret != 0) {
-					relay_abort_http(con, 400,
-					    "malformed host", 0);
+			if (desc->http_method != HTTP_METHOD_NONE &&
+			    strcasecmp("Content-Length", key) == 0) {
+				switch (desc->http_method) {
+				case HTTP_METHOD_TRACE:
+				case HTTP_METHOD_CONNECT:
+					/*
+					 * These methods should not have a body
+					 * and thus no Content-Length header.
+					 */
+					relay_abort_http(con, 400, "malformed",
+					    0);
+					goto abort;
+				case HTTP_METHOD_GET:
+				case HTTP_METHOD_HEAD:
+				case HTTP_METHOD_COPY:
+				case HTTP_METHOD_MOVE:
+					/*
+					 * We strip the body (if present) from
+					 * the GET, HEAD, COPY and MOVE methods
+					 * so strip Content-Length too.
+					 */
+					kv_delete(&desc->http_headers,
+					    desc->http_lastheader);
+					break;
+				case HTTP_METHOD_RESPONSE:
+					if (request_method == HTTP_METHOD_HEAD)
+						break;
+					/* FALLTHROUGH */
+				default:
+					/*
+					 * Need to read data from the client
+					 * after the HTTP header.
+					 * XXX What about non-standard clients
+					 * not using the carriage return? And
+					 * some browsers seem to include the
+					 * line length in the content-length.
+					 */
+					if (*value == '+' || *value == '-') {
+						errstr = "invalid";
+					} else {
+						cre->toread = strtonum(value, 0,
+						    LLONG_MAX, &errstr);
+					}
+					if (errstr) {
+						relay_abort_http(con, 500,
+						    errstr, 0);
+						goto abort;
+					}
+					break;
+				}
+				/*
+				 * Response with a status code of 1xx
+				 * (Informational) or 204 (No Content) MUST
+				 * not have a Content-Length (rfc 7230 3.3.3)
+				 * Instead we check for value != 0 because there
+				 * are servers that do not follow the rfc and
+				 * send Content-Length: 0.
+				 */
+				if (desc->http_method == HTTP_METHOD_RESPONSE &&
+				    (((desc->http_status >= 100 &&
+				    desc->http_status < 200) ||
+				    desc->http_status == 204)) &&
+				    cre->toread != 0) {
+					relay_abort_http(con, 502,
+					    "Bad Gateway", 0);
 					goto abort;
 				}
 			}
-		} else
-			unique = 0;
-
-		if (cre->line != 1) {
-			if (cre->dir == RELAY_DIR_REQUEST) {
-				if (strcasecmp("Connection", key) == 0 &&
-				    strcasecmp("Upgrade", value) == 0)
-					priv->http_upgrade_req |=
-					    HTTP_CONNECTION_UPGRADE;
-				if (strcasecmp("Upgrade", key) == 0 &&
-				    strcasecmp("websocket", value) == 0)
-					priv->http_upgrade_req |=
-					    HTTP_UPGRADE_WEBSOCKET;
+			if (strcasecmp("Transfer-Encoding", key) == 0) {
+				/* We don't support other encodings. */
+				if (strcasecmp("chunked", value) != 0) {
+					relay_abort_http(con, 400,
+					    "malformed", 0);
+					goto abort;
+				}
+				desc->http_chunked = 1;
 			}
 
-			if ((hdr = kv_add(&desc->http_headers, key,
-			    value, unique)) == NULL) {
-				relay_abort_http(con, 400,
-				    "malformed header", 0);
-				goto abort;
+			if (strcasecmp("Host", key) == 0) {
+				/*
+				 * The path may contain a URL.  The host in the
+				 * URL has to match the Host: value.
+				 */
+				if (parse_url(desc->http_path,
+				    &urlproto, &host, &path) == 0) {
+					ret = strcasecmp(host, value);
+					free(urlproto);
+					free(host);
+					free(path);
+					if (ret != 0) {
+						relay_abort_http(con, 400,
+						    "malformed host", 0);
+						goto abort;
+					}
+				}
 			}
-			desc->http_lastheader = hdr;
 		}
+
+		if (cre->done)
+			break;
+
+		/* Validate header field name and check for missing value. */
+		key = line;
+		if ((value = strchr(line, ':')) == NULL) {
+			relay_abort_http(con, 400, "malformed", 0);
+			goto abort;
+		}
+		*value++ = '\0';
+		value += strspn(value, " \t\r\n");
+
+		if (!relay_http_header_name_valid(key)) {
+			relay_abort_http(con, 400, "malformed", 0);
+			goto abort;
+		}
+
+		/* The "Host" header must only occur once. */
+		unique = strcasecmp("Host", key) == 0;
+
+		if ((hdr = kv_add(&desc->http_headers, key,
+		    value, unique)) == NULL) {
+			relay_abort_http(con, 400, "malformed header", 0);
+			goto abort;
+		}
+		desc->http_lastheader = hdr;
 
 		free(line);
 	}
+
 	if (cre->done) {
 		if (desc->http_method == HTTP_METHOD_NONE) {
 			relay_abort_http(con, 406, "no method", 0);
@@ -445,42 +564,45 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			return;
 		}
 
-		/* HTTP 101 Switching Protocols */
-		if (cre->dir == RELAY_DIR_REQUEST) {
-			if ((priv->http_upgrade_req & HTTP_UPGRADE_WEBSOCKET) &&
-			    !(proto->httpflags & HTTPFLAG_WEBSOCKETS)) {
+		/*
+		 * HTTP 101 Switching Protocols
+		 */
+
+		upgrade = kv_find_value(&desc->http_headers,
+		    "Connection", "upgrade", ",");
+		upgrade_ws = kv_find_value(&desc->http_headers,
+		    "Upgrade", "websocket", ",");
+		ws_response = 0;
+		if (cre->dir == RELAY_DIR_REQUEST && upgrade_ws != NULL) {
+			if ((proto->httpflags & HTTPFLAG_WEBSOCKETS) == 0) {
 				relay_abort_http(con, 403,
 				    "Websocket Forbidden", 0);
 				return;
-			}
-			if ((priv->http_upgrade_req & HTTP_UPGRADE_WEBSOCKET) &&
-			    !(priv->http_upgrade_req & HTTP_CONNECTION_UPGRADE))
-			{
+			} else if (upgrade == NULL) {
 				relay_abort_http(con, 400,
 				    "Bad Websocket Request", 0);
 				return;
-			}
-			if ((priv->http_upgrade_req & HTTP_UPGRADE_WEBSOCKET) &&
-			    (desc->http_method != HTTP_METHOD_GET)) {
+			} else if (desc->http_method != HTTP_METHOD_GET) {
 				relay_abort_http(con, 405,
 				    "Websocket Method Not Allowed", 0);
 				return;
 			}
 		} else if (cre->dir == RELAY_DIR_RESPONSE &&
 		    desc->http_status == 101) {
-			if (((priv->http_upgrade_req &
-			    (HTTP_CONNECTION_UPGRADE | HTTP_UPGRADE_WEBSOCKET))
-			    ==
-			    (HTTP_CONNECTION_UPGRADE | HTTP_UPGRADE_WEBSOCKET))
-			    && proto->httpflags & HTTPFLAG_WEBSOCKETS) {
+			if (upgrade_ws != NULL && upgrade != NULL &&
+			    (proto->httpflags & HTTPFLAG_WEBSOCKETS)) {
+				ws_response = 1;
 				cre->dst->toread = TOREAD_UNLIMITED;
 				cre->dst->bev->readcb = relay_read;
-			}  else  {
+			} else {
 				relay_abort_http(con, 502,
 				    "Bad Websocket Gateway", 0);
 				return;
 			}
 		}
+
+		connection_close = kv_find_value(&desc->http_headers,
+		    "Connection", "close", ",");
 
 		switch (desc->http_method) {
 		case HTTP_METHOD_CONNECT:
@@ -524,8 +646,9 @@ relay_read_http(struct bufferevent *bev, void *arg)
 		case HTTP_METHOD_SEARCH:
 		case HTTP_METHOD_PATCH:
 			/* HTTP request payload */
-			if (cre->toread > 0)
+			if (cre->toread > 0) {
 				bev->readcb = relay_read_httpcontent;
+			}
 
 			/* Single-pass HTTP body */
 			if (cre->toread < 0) {
@@ -544,6 +667,18 @@ relay_read_http(struct bufferevent *bev, void *arg)
 			cre->toread = TOREAD_HTTP_CHUNK_LENGTH;
 			bev->readcb = relay_read_httpchunks;
 		}
+
+		/*
+		 * Ask the server to close the connection after this request
+		 * since we don't read any further request headers. Only add
+		 * this header if it does not already exist or if this is a
+		 * outbound websocket upgrade response.
+		 */
+		if (cre->toread == TOREAD_UNLIMITED &&
+			connection_close == NULL && !ws_response)
+			if (kv_add(&desc->http_headers, "Connection",
+			    "close", 0) == NULL)
+				goto fail;
 
 		if (cre->dir == RELAY_DIR_REQUEST) {
 			if (relay_writerequest_http(cre->dst, cre) == -1)
@@ -662,7 +797,7 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 	struct rsession		*con = cre->con;
 	struct protocol		*proto = con->se_relay->rl_proto;
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
-	char			*line;
+	char			*line, *ep;
 	long long		 llval;
 	size_t			 size, linelen;
 
@@ -707,10 +842,19 @@ relay_read_httpchunks(struct bufferevent *bev, void *arg)
 		}
 
 		/*
-		 * Read prepended chunk size in hex, ignore the trailer.
+		 * Read prepended chunk size in hex without leading +0[Xx].
 		 * The returned signed value must not be negative.
 		 */
-		if (sscanf(line, "%llx", &llval) != 1 || llval < 0) {
+		if (line[0] == '+' || line[0] == '-' ||
+		    (line[0] == '0' && (line[1] == 'x' || line[1] == 'X'))) {
+			/* Reject values like 0xdead and 0XBEEF or +FEED. */
+			ep = line;
+		} else {
+			errno = 0;
+			llval = strtoll(line, &ep, 16);
+		}
+		if (ep == line || *ep != '\0' || llval < 0 ||
+		    (errno == ERANGE && llval == LLONG_MAX)) {
 			free(line);
 			relay_close(con, "invalid chunk size", 1);
 			return;
@@ -1130,6 +1274,19 @@ relay_abort_http(struct rsession *con, u_int code, const char *msg,
 void
 relay_close_http(struct rsession *con)
 {
+	struct http_session	*hs = con->se_priv;
+	struct http_method_node	*hmn;
+
+	DPRINTF("%s: session %d http_session %p", __func__,
+		con->se_id, hs);
+	if (hs != NULL)
+		while (!SIMPLEQ_EMPTY(&hs->hs_methods)) {
+			hmn = SIMPLEQ_FIRST(&hs->hs_methods);
+			SIMPLEQ_REMOVE_HEAD(&hs->hs_methods, hmn_entry);
+			DPRINTF("%s: session %d freeing %s", __func__,
+			    con->se_id, relay_httpmethod_byid(hmn->hmn_method));
+			free(hmn);
+		}
 	relay_httpdesc_free(con->se_in.desc);
 	free(con->se_in.desc);
 	relay_httpdesc_free(con->se_out.desc);
@@ -1140,13 +1297,30 @@ char *
 relay_expand_http(struct ctl_relay_event *cre, char *val, char *buf,
     size_t len)
 {
-	struct rsession	*con = cre->con;
-	struct relay	*rlay = con->se_relay;
-	char		 ibuf[128];
+	struct rsession		*con = cre->con;
+	struct relay		*rlay = con->se_relay;
+	struct http_descriptor	*desc = cre->desc;
+	struct kv		*host, key;
+	char			 ibuf[128];
 
 	if (strlcpy(buf, val, len) >= len)
 		return (NULL);
 
+	if (strstr(val, "$HOST") != NULL) {
+		key.kv_key = "Host";
+		host = kv_find(&desc->http_headers, &key);
+		if (host) {
+			if (host->kv_value == NULL)
+				return (NULL);
+			snprintf(ibuf, sizeof(ibuf), "%s", host->kv_value);
+		} else {
+			if (print_host(&rlay->rl_conf.ss,
+			    ibuf, sizeof(ibuf)) == NULL)
+				return (NULL);
+		}
+		if (expand_string(buf, len, "$HOST", ibuf))
+			return (NULL);
+	}
 	if (strstr(val, "$REMOTE_") != NULL) {
 		if (strstr(val, "$REMOTE_ADDR") != NULL) {
 			if (print_host(&cre->ss, ibuf, sizeof(ibuf)) == NULL)
@@ -1418,14 +1592,16 @@ relay_httppath_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 
 	if (cre->dir == RELAY_DIR_RESPONSE || kv->kv_type != KEY_TYPE_PATH)
 		return (0);
-	else if (kv->kv_key == NULL)
-		return (0);
-	else if (fnmatch(kv->kv_key, desc->http_path, 0) == FNM_NOMATCH)
-		return (-1);
-	else if (kv->kv_value != NULL && kv->kv_option == KEY_OPTION_NONE) {
-		query = desc->http_query == NULL ? "" : desc->http_query;
-		if (fnmatch(kv->kv_value, query, FNM_CASEFOLD) == FNM_NOMATCH)
+	else if (kv->kv_option != KEY_OPTION_STRIP) {
+		if (kv->kv_key == NULL)
+			return (0);
+		else if (fnmatch(kv->kv_key, desc->http_path, 0) == FNM_NOMATCH)
 			return (-1);
+		else if (kv->kv_value != NULL && kv->kv_option == KEY_OPTION_NONE) {
+			query = desc->http_query == NULL ? "" : desc->http_query;
+			if (fnmatch(kv->kv_value, query, FNM_CASEFOLD) == FNM_NOMATCH)
+				return (-1);
+		}
 	}
 
 	relay_match(actions, kv, match, NULL);
@@ -1509,20 +1685,20 @@ relay_httpcookie_test(struct ctl_relay_event *cre, struct relay_rule *rule,
 
 int
 relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
-    struct kvlist *matches, struct kvlist *actions)
+    struct kvlist *matches, struct kvlist *actions, struct relay_table **tbl)
 {
 	struct rsession		*con = cre->con;
-	struct kv		*kv, *tmp;
+	struct kv		*kv;
 
 	/*
 	 * Apply the following options instantly (action per match).
 	 */
-	if (rule->rule_table != NULL)
-		con->se_table = rule->rule_table;
-
+	if (rule->rule_table != NULL) {
+		*tbl = rule->rule_table;
+		con->se_out.ss.ss_family = AF_UNSPEC;
+	}
 	if (rule->rule_tag != 0)
 		con->se_tag = rule->rule_tag == -1 ? 0 : rule->rule_tag;
-
 	if (rule->rule_label != 0)
 		con->se_label = rule->rule_label == -1 ? 0 : rule->rule_label;
 
@@ -1531,10 +1707,7 @@ relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
 	 */
 	if (matches == NULL) {
 		/* 'pass' or 'block' rule */
-		TAILQ_FOREACH_SAFE(kv, &rule->rule_kvlist, kv_rule_entry, tmp) {
-			TAILQ_INSERT_TAIL(actions, kv, kv_action_entry);
-			TAILQ_REMOVE(&rule->rule_kvlist, kv, kv_rule_entry);
-		}
+		TAILQ_CONCAT(actions, &rule->rule_kvlist, kv_rule_entry);
 	} else {
 		/* 'match' rule */
 		TAILQ_FOREACH(kv, matches, kv_match_entry) {
@@ -1546,14 +1719,15 @@ relay_match_actions(struct ctl_relay_event *cre, struct relay_rule *rule,
 }
 
 int
-relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
+relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions,
+    struct relay_table *tbl)
 {
 	struct rsession		*con = cre->con;
 	struct http_descriptor	*desc = cre->desc;
 	struct kv		*host = NULL;
 	const char		*value;
 	struct kv		*kv, *match, *kp, *mp, kvcopy, matchcopy, key;
-	int			 addkv, ret;
+	int			 addkv, ret, nstrip;
 	char			 buf[IBUF_READ_SIZE], *ptr;
 	char			*msg = NULL;
 	const char		*meth = NULL;
@@ -1654,6 +1828,15 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 		case KEY_OPTION_LOG:
 			/* perform this later */
 			break;
+		case KEY_OPTION_STRIP:
+			nstrip = strtonum(kv->kv_value, 0, INT_MAX, NULL);
+			if (kv->kv_type == KEY_TYPE_PATH) {
+				if (kv_setkey(match, "%s",
+				    server_root_strip(match->kv_key,
+				    nstrip)) == -1)
+					goto fail;
+			}
+			break;
 		default:
 			fatalx("%s: invalid action", __func__);
 			/* NOTREACHED */
@@ -1676,7 +1859,7 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 			if ((ptr = relay_expand_http(cre, kp->kv_value, buf,
 			    sizeof(buf))) == NULL)
 				goto fail;
-			if (kv_set(match, ptr) == -1)
+			if (kv_set(match, "%s", ptr) == -1)
 				goto fail;
 		}
 
@@ -1735,12 +1918,22 @@ relay_apply_actions(struct ctl_relay_event *cre, struct kvlist *actions)
 	}
 
 	/*
+	 * Change the backend if the forward table has been changed.
+	 * This only works in the request direction.
+	 */
+	if (cre->dir == RELAY_DIR_REQUEST && con->se_table != tbl) {
+		relay_reset_event(con, &con->se_out);
+		con->se_table = tbl;
+		con->se_haslog = 1;
+	}
+
+	/*
 	 * log tag for request and response, request method
 	 * and end of request marker ","
 	 */
 	if ((con->se_log != NULL) &&
 	    ((meth = relay_httpmethod_byid(desc->http_method)) != NULL) &&
-	    (asprintf(&msg, " %s",meth) >= 0))
+	    (asprintf(&msg, " %s", meth) != -1))
 		evbuffer_add(con->se_log, msg, strlen(msg));
 	free(msg);
 	relay_log(con, cre->dir == RELAY_DIR_REQUEST ? "" : ";");
@@ -1770,7 +1963,7 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 	struct rsession		*con;
 	struct http_descriptor	*desc = cre->desc;
 	struct relay_rule	*r = NULL, *rule = NULL;
-	u_int			 cnt = 0;
+	struct relay_table	*tbl = NULL;
 	u_int			 action = RES_PASS;
 	struct kvlist		 actions, matches;
 	struct kv		*kv;
@@ -1781,8 +1974,6 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 
 	r = TAILQ_FIRST(&proto->rules);
 	while (r != NULL) {
-		cnt++;
-
 		TAILQ_INIT(&matches);
 		TAILQ_INIT(&r->rule_kvlist);
 
@@ -1790,13 +1981,12 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_DIR);
 		else if (proto->type != r->rule_proto)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_PROTO);
-		else if (r->rule_af != AF_UNSPEC &&
-		    (cre->ss.ss_family != r->rule_af ||
-		     cre->dst->ss.ss_family != r->rule_af))
+		else if (RELAY_AF_NEQ(r->rule_af, cre->ss.ss_family) ||
+		     RELAY_AF_NEQ(r->rule_af, cre->dst->ss.ss_family))
 			RELAY_GET_SKIP_STEP(RULE_SKIP_AF);
 		else if (RELAY_ADDR_CMP(&r->rule_src, &cre->ss) != 0)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_SRC);
-		else if (RELAY_ADDR_CMP(&r->rule_dst, &cre->dst->ss) != 0)
+		else if (RELAY_ADDR_CMP(&r->rule_dst, &con->se_sockname) != 0)
 			RELAY_GET_SKIP_STEP(RULE_SKIP_DST);
 		else if (r->rule_method != HTTP_METHOD_NONE &&
 		    (desc->http_method == HTTP_METHOD_RESPONSE ||
@@ -1820,7 +2010,7 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 
 			if (r->rule_action == RULE_ACTION_MATCH) {
 				if (relay_match_actions(cre, r, &matches,
-				    &actions) != 0) {
+				    &actions, &tbl) != 0) {
 					/* Something bad happened, drop */
 					action = RES_DROP;
 					break;
@@ -1854,13 +2044,13 @@ relay_test(struct protocol *proto, struct ctl_relay_event *cre)
 		}
 	}
 
-	if (rule != NULL && relay_match_actions(cre, rule, NULL, &actions)
+	if (rule != NULL && relay_match_actions(cre, rule, NULL, &actions, &tbl)
 	    != 0) {
 		/* Something bad happened, drop */
 		action = RES_DROP;
 	}
 
-	if (relay_apply_actions(cre, &actions) != 0) {
+	if (relay_apply_actions(cre, &actions, tbl) != 0) {
 		/* Something bad happened, drop */
 		action = RES_DROP;
 	}
@@ -1895,7 +2085,7 @@ relay_calc_skip_steps(struct relay_rules *rules)
 			RELAY_SET_SKIP_STEPS(RULE_SKIP_DIR);
 		else if (cur->rule_proto != prev->rule_proto)
 			RELAY_SET_SKIP_STEPS(RULE_SKIP_PROTO);
-		else if (cur->rule_af != prev->rule_af)
+		else if (RELAY_AF_NEQ(cur->rule_af, prev->rule_af))
 			RELAY_SET_SKIP_STEPS(RULE_SKIP_AF);
 		else if (RELAY_ADDR_NEQ(&cur->rule_src, &prev->rule_src))
 			RELAY_SET_SKIP_STEPS(RULE_SKIP_SRC);
@@ -1921,3 +2111,19 @@ relay_match(struct kvlist *actions, struct kv *kv, struct kv *match,
 		TAILQ_INSERT_TAIL(actions, kv, kv_match_entry);
 	}
 }
+
+char *
+server_root_strip(char *path, int n)
+{
+	char *p;
+
+	/* Strip strip leading directories. Leading '/' is ignored. */
+	for (; n > 0 && *path != '\0'; n--)
+		if ((p = strchr(++path, '/')) != NULL)
+			path = p;
+		else
+			path--;
+
+	return (path);
+}
+

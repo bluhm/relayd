@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_tcp.c,v 1.56 2018/04/14 20:42:41 benno Exp $	*/
+/*	$OpenBSD: check_tcp.c,v 1.61 2023/07/03 09:38:08 claudio Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -171,6 +171,7 @@ tcp_host_up(struct ctl_tcp_event *cte)
 		cte->validate_read = NULL;
 		cte->validate_close = check_http_digest;
 		break;
+	case CHECK_BINSEND_EXPECT:
 	case CHECK_SEND_EXPECT:
 		cte->validate_read = check_send_expect;
 		cte->validate_close = check_send_expect;
@@ -182,8 +183,7 @@ tcp_host_up(struct ctl_tcp_event *cte)
 		return;
 	}
 
-	if (cte->table->sendbuf != NULL) {
-		cte->req = cte->table->sendbuf;
+	if (cte->table->sendbuf != NULL || cte->table->sendbinbuf != NULL) {
 		event_again(&cte->ev, cte->s, EV_TIMEOUT|EV_WRITE, tcp_send_req,
 		    &cte->tv_start, &cte->table->conf.timeout, cte);
 		return;
@@ -199,6 +199,7 @@ void
 tcp_send_req(int s, short event, void *arg)
 {
 	struct ctl_tcp_event	*cte = arg;
+	char			*req;
 	int			 bs;
 	int			 len;
 
@@ -207,9 +208,20 @@ tcp_send_req(int s, short event, void *arg)
 		hce_notify_done(cte->host, HCE_TCP_WRITE_TIMEOUT);
 		return;
 	}
-	len = strlen(cte->req);
+
+	if (cte->table->sendbinbuf != NULL) {
+		len = ibuf_size(cte->table->sendbinbuf);
+		req = ibuf_data(cte->table->sendbinbuf);
+		log_debug("%s: table %s sending binary", __func__,
+		    cte->table->conf.name);
+		print_hex(req, 0, len);
+	} else {
+		len = strlen(cte->table->sendbuf);
+		req = cte->table->sendbuf;
+	}
+
 	do {
-		bs = write(s, cte->req, len);
+		bs = write(s, req, len);
 		if (bs == -1) {
 			if (errno == EAGAIN || errno == EINTR)
 				goto retry;
@@ -218,7 +230,7 @@ tcp_send_req(int s, short event, void *arg)
 			hce_notify_done(cte->host, HCE_TCP_WRITE_FAIL);
 			return;
 		}
-		cte->req += bs;
+		req += bs;
 		len -= bs;
 	} while (len > 0);
 
@@ -289,25 +301,42 @@ check_send_expect(struct ctl_tcp_event *cte)
 {
 	u_char	*b;
 
-	/*
-	 * ensure string is nul-terminated.
-	 */
-	b = ibuf_reserve(cte->buf, 1);
-	if (b == NULL)
-		fatal("out of memory");
-	*b = '\0';
-	if (fnmatch(cte->table->conf.exbuf, cte->buf->buf, 0) == 0) {
-		cte->host->he = HCE_SEND_EXPECT_OK;
-		cte->host->up = HOST_UP;
-		return (0);
+	if (cte->table->conf.check == CHECK_BINSEND_EXPECT) {
+		size_t   exlen;
+
+		exlen = strlen(cte->table->conf.exbuf) / 2;
+		log_debug("%s: table %s expecting binary",
+		    __func__, cte->table->conf.name);
+		print_hex(cte->table->conf.exbinbuf, 0, exlen);
+
+		if (ibuf_size(cte->buf) >= exlen && memcmp(ibuf_data(cte->buf),
+		    cte->table->conf.exbinbuf, exlen) == 0) {
+			cte->host->he = HCE_SEND_EXPECT_OK;
+			cte->host->up = HOST_UP;
+			return (0);
+		} else if (ibuf_size(cte->buf) >= exlen) {
+			log_debug("%s: table %s received mismatching binary",
+			    __func__, cte->table->conf.name);
+			print_hex(ibuf_data(cte->buf), 0, ibuf_size(cte->buf));
+		}
+	} else if (cte->table->conf.check == CHECK_SEND_EXPECT) {
+		/*
+		 * ensure string is nul-terminated.
+		 */
+		b = strndup(ibuf_data(cte->buf), ibuf_size(cte->buf));
+		if (b == NULL)
+			fatal("out of memory");
+		if (fnmatch(cte->table->conf.exbuf, b, 0) == 0) {
+			cte->host->he = HCE_SEND_EXPECT_OK;
+			cte->host->up = HOST_UP;
+			free(b);
+			return (0);
+		}
+		free(b);
 	}
+
 	cte->host->he = HCE_SEND_EXPECT_FAIL;
 	cte->host->up = HOST_UNKNOWN;
-
-	/*
-	 * go back to original position.
-	 */
-	cte->buf->wpos--;
 	return (1);
 }
 
@@ -317,19 +346,16 @@ check_http_code(struct ctl_tcp_event *cte)
 	char		*head;
 	char		 scode[4];
 	const char	*estr;
-	u_char		*b;
 	int		 code;
 	struct host	*host;
 
 	/*
 	 * ensure string is nul-terminated.
 	 */
-	b = ibuf_reserve(cte->buf, 1);
-	if (b == NULL)
+	if (ibuf_add_zero(cte->buf, 1) == -1)
 		fatal("out of memory");
-	*b = '\0';
 
-	head = cte->buf->buf;
+	head = ibuf_data(cte->buf);
 	host = cte->host;
 	host->he = HCE_HTTP_CODE_ERROR;
 	host->code = 0;
@@ -371,19 +397,16 @@ int
 check_http_digest(struct ctl_tcp_event *cte)
 {
 	char		*head;
-	u_char		*b;
 	char		 digest[SHA1_DIGEST_STRING_LENGTH];
 	struct host	*host;
 
 	/*
 	 * ensure string is nul-terminated.
 	 */
-	b = ibuf_reserve(cte->buf, 1);
-	if (b == NULL)
+	if (ibuf_add_zero(cte->buf, 1) == -1)
 		fatal("out of memory");
-	*b = '\0';
 
-	head = cte->buf->buf;
+	head = ibuf_data(cte->buf);
 	host = cte->host;
 	host->he = HCE_HTTP_DIGEST_ERROR;
 

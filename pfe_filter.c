@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe_filter.c,v 1.62 2017/05/28 10:39:15 benno Exp $	*/
+/*	$OpenBSD: pfe_filter.c,v 1.66 2024/06/17 08:02:57 sashan Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -377,6 +377,11 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 		rio.rule.direction = PF_IN;
 		rio.rule.keep_state = PF_STATE_NORMAL;
 
+		if (rdr->conf.flags & F_PFLOG)
+			rio.rule.log = 1;
+		else
+			rio.rule.log = 0; /* allow change via reload */
+
 		switch (t->conf.fwdmode) {
 		case FWD_NORMAL:
 			/* traditional redirection */
@@ -632,7 +637,8 @@ check_table(struct relayd *env, struct rdr *rdr, struct table *table)
 		goto toolong;
 
 	if (ioctl(env->sc_pf->dev, DIOCRGETTSTATS, &io) == -1)
-		fatal("%s: cannot get table stats", __func__);
+		fatal("%s: cannot get table stats for %s@%s", __func__,
+		    io.pfrio_table.pfrt_name, io.pfrio_table.pfrt_anchor);
 
 	return (tstats.pfrts_match);
 
